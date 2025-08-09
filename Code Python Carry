@@ -1,0 +1,648 @@
+# =========================
+# SOLUTION A — Cohérence via représentants + timestamps communs
+# =========================
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ---- Buckets & combos (reprennent tes définitions) ----
+Maturity_Buckets = {
+    1:(0.5,1.5), 2:(1.8,2.5), 3:(2.5,3.5), 4:(3.5,4.5), 5:(4.5,5.5),
+    7:(6.5,7.5), 10:(9,11), 15:(13,17), 20:(18,22), 25:(23,27), 30:(27,33)
+}
+maturity_combinations = [(2,10),(5,10),(2,30),(5,30),(10,30),(10,15)]
+fly_combinations      = [(2,5,10),(5,7,10),(10,15,30),(5,10,30)]
+today = pd.Timestamp.today().normalize()
+
+# ---------- helpers génériques ----------
+def years_to_maturity(bond_name: str):
+    try:
+        parts = bond_name.split()
+        d = datetime.strptime(parts[3], "%d-%b-%Y")
+        return (d - today).days / 365.25
+    except Exception:
+        return None
+
+def get_maturity_bucket(bond_name: str):
+    y = years_to_maturity(bond_name)
+    if y is None: return None
+    for b,(lo,hi) in Maturity_Buckets.items():
+        if lo <= y <= hi: return b
+    return None
+
+def filter_yield_bonds(df: pd.DataFrame, min_days: int = 63):
+    keep = []
+    for c in df.columns:
+        s = df[c]
+        if len(s.dropna()) >= min_days and s.iloc[-min_days:].isna().sum() == 0:
+            keep.append(c)
+    return df[keep], keep
+
+def filter_carry_bonds(df: pd.DataFrame):
+    keep = []
+    for c in df.columns:
+        s = df[c]
+        if not pd.isna(s.iloc[-1]):
+            keep.append(c)
+    return df[keep], keep
+
+def prepare_filtered_inputs(bond_lists, carry_dfs, yield_dfs):
+    filtered_bond_lists, filtered_carry_dfs, filtered_yield_dfs = {}, {}, {}
+    for c in bond_lists:
+        df_carry, carry_cols = filter_carry_bonds(carry_dfs[c])
+        df_yield, yld_cols   = filter_yield_bonds(yield_dfs[c])
+        common = sorted(set(carry_cols) & set(yld_cols))
+        filtered_carry_dfs[c] = df_carry[common]
+        filtered_yield_dfs[c] = df_yield[common]
+        filtered_bond_lists[c] = [b for b in bond_lists[c] if b in common]
+    return filtered_bond_lists, filtered_carry_dfs, filtered_yield_dfs
+
+def recent_enough(idx: pd.Index, max_age_days=7) -> bool:
+    if len(idx)==0: return False
+    return (today - pd.Timestamp(idx[-1])).days <= max_age_days
+
+def last_common_value(*series_list: pd.Series):
+    """Retourne (values[], ts) au dernier timestamp commun des séries non-NaN."""
+    if not series_list: return [], None
+    idx = series_list[0].dropna().index
+    for s in series_list[1:]:
+        idx = idx.intersection(s.dropna().index)
+        if len(idx)==0: return [], None
+    ts = idx[-1]
+    vals = [float(s.loc[ts]) for s in series_list]
+    return vals, ts
+
+def bucket_center(b): 
+    lo, hi = Maturity_Buckets[b]; return 0.5*(lo+hi)
+
+def select_representatives(filtered_bond_lists, filtered_carry_dfs, filtered_yield_dfs):
+    """
+    reps[country][bucket] = bond
+    Choix = |years - centre_bucket| minimal, tie-break = fraicheur carry.
+    Exige : dernier carry non-NaN et 63 derniers yields non-NaN.
+    """
+    reps = {c:{} for c in filtered_bond_lists}
+    for country, bonds in filtered_bond_lists.items():
+        c_c = filtered_carry_dfs[country]; y_y = filtered_yield_dfs[country]
+        # regroupe candidats
+        by_bucket = {}
+        for b in bonds:
+            m = get_maturity_bucket(b)
+            if m is None: continue
+            if b not in c_c.columns or b not in y_y.columns: continue
+            if pd.isna(c_c[b].iloc[-1]) or y_y[b].iloc[-63:].isna().any(): continue
+            by_bucket.setdefault(m, []).append(b)
+        # choisit le représentant
+        for buck, blist in by_bucket.items():
+            tgt = bucket_center(buck)
+            best = None
+            best_key = (1e9, 1e9)  # distance, freshness (jours)
+            for b in blist:
+                y = years_to_maturity(b)
+                if y is None: continue
+                dist = abs(y - tgt)
+                last_idx = c_c[b].dropna().index
+                if len(last_idx)==0: continue
+                freshness = (today - pd.Timestamp(last_idx[-1])).days
+                key = (dist, freshness)
+                if key < best_key:
+                    best_key = key; best = b
+            if best is not None:
+                reps[country][buck] = best
+    return reps
+
+def fly_weights(s, m, l): return {s:-1.0, m:2.0, l:-1.0}
+
+# ---------- fallback outliers (si tout négatif, on garde le "moins pire") ----------
+def reduce_group_with_fallback(group, value_cols_map):
+    """
+    value_cols_map = dict pour ce type:
+      spreads : {"carry":"CarrySpread", "cov":"CarryOverVol"}
+      boxes   : {"carry":"Carry",       "cov":"CarryOverVol"}
+    Règle :
+      - S'il existe au moins un (carry>0 & cov>0) -> on applique ta règle (1/2 points, sinon ±1.5σ puis moyenne)
+      - Sinon -> on prend la ligne idxmax(cov) (le moins pire)
+    Retourne une Series (moyennes/valeurs).
+    """
+    carry_col = value_cols_map["carry"]
+    cov_col   = value_cols_map["cov"]
+
+    pos = group[(group[cov_col] > 0) & (group[carry_col] > 0)]
+    use_group = pos if not pos.empty else group
+
+    if len(use_group) == 1:
+        return use_group.iloc[0]
+    if len(use_group) == 2:
+        return use_group.loc[use_group[cov_col].idxmax()]
+
+    mean_cov = use_group[cov_col].mean()
+    std_cov  = use_group[cov_col].std(ddof=0)
+    fg = use_group[(use_group[cov_col] >= mean_cov - 1.5*std_cov) &
+                   (use_group[cov_col] <= mean_cov + 1.5*std_cov)]
+    if fg.empty:
+        # si rien après filtre, garde le best cov
+        return use_group.loc[use_group[cov_col].idxmax()]
+    # moyenne sur fg
+    return pd.Series({
+        carry_col: fg[carry_col].mean(),
+        "Vol": fg["Vol"].mean(),
+        cov_col: fg[cov_col].mean(),
+        "Min": fg["Min"].mean(), "Q25": fg["Q25"].mean(), "Q50": fg["Q50"].mean(),
+        "Q75": fg["Q75"].mean(), "Max": fg["Max"].mean(), "CarryOneWeekAgo": fg["CarryOneWeekAgo"].mean()
+    })
+
+# ================= 1) df_spread (reps + timestamps communs) =================
+def compute_spreads_nearest(bond_lists, carry_dataframes, yield_dataframes):
+    rows = []
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+
+    for country in country_list:
+        if country == benchmark_country: continue
+        for buck, b_c in reps[country].items():
+            if buck not in reps[benchmark_country]: continue
+            b_d = reps[benchmark_country][buck]
+            s_c, s_d = f_carry[country][b_c], f_carry[benchmark_country][b_d]
+            vals, ts = last_common_value(s_c, s_d)
+            if ts is None or (today - pd.Timestamp(ts)).days > 7: continue
+            carry_spread = vals[0] - vals[1]
+
+            y_c, y_d = f_yield[country][b_c], f_yield[benchmark_country][b_d]
+            dates = y_c.index.intersection(y_d.index)
+            yd = (y_c.reindex(dates) - y_d.reindex(dates)).dropna()*100.0
+            if len(yd) < 40 or (today - pd.Timestamp(yd.index[-1])).days > 7: continue
+            vol = yd[-min(63,len(yd)) :].std()
+            if pd.isna(vol) or vol==0: continue
+
+            s_ch, s_dh = s_c.dropna(), s_d.dropna()
+            common = s_ch.index.intersection(s_dh.index)
+            hist = (s_ch.reindex(common) - s_dh.reindex(common)).dropna()
+            if len(hist) < 40: continue
+            qwin = hist[-min(126,len(hist)):]
+            qs = qwin.quantile([0,.25,.5,.75,1])
+            wk = hist.iloc[-8] if len(hist)>=8 else np.nan
+
+            rows.append({
+                "CountryPair": f"{country}-{benchmark_country}",
+                "CarrySpread": carry_spread, "Vol": vol, "CarryOverVol": carry_spread/vol,
+                "Maturity": buck, "Min": qs.iloc[0], "Q25": qs.iloc[1], "Q50": qs.iloc[2],
+                "Q75": qs.iloc[3], "Max": qs.iloc[4], "CarryOneWeekAgo": wk,
+                "Bond1": b_c, "Bond2": b_d, "TS": ts, "Country": country
+            })
+    return pd.DataFrame(rows)
+
+def remove_outliers_and_average_spread(df_spread: pd.DataFrame):
+    out = []
+    for (cp, buck), g in df_spread.groupby(["CountryPair","Maturity"]):
+        country = str(cp).split("-")[0]
+        r = reduce_group_with_fallback(g, {"carry":"CarrySpread","cov":"CarryOverVol"})
+        if isinstance(r, pd.Series):
+            out.append({
+                "Country": country, "Bucket": buck,
+                "CarrySpread": float(r.get("CarrySpread", g["CarrySpread"].mean())),
+                "Vol": float(r.get("Vol", g["Vol"].mean())),
+                "CarryOverVol": float(r.get("CarryOverVol", g["CarryOverVol"].mean())),
+                "Min": float(r.get("Min", g["Min"].mean())),
+                "Q25": float(r.get("Q25", g["Q25"].mean())),
+                "Q50": float(r.get("Q50", g["Q50"].mean())),
+                "Q75": float(r.get("Q75", g["Q75"].mean())),
+                "Max": float(r.get("Max", g["Max"].mean())),
+                "CarryOneWeekAgo": float(r.get("CarryOneWeekAgo", g["CarryOneWeekAgo"].mean())),
+            })
+    return pd.DataFrame(out)
+
+def pivot_spread(best_spread: pd.DataFrame, maturity_order=(1,2,3,4,5,7,10,15,20,25,30)):
+    if best_spread.empty: return pd.DataFrame()
+    pivot_df = best_spread.pivot(index='Country', columns='Bucket', values=['CarrySpread','Vol'])
+    pivot_df.columns = pivot_df.columns.swaplevel(0,1)
+    existing = [m for m in maturity_order if m in pivot_df.columns.levels[0]]
+    return pivot_df.reindex(columns=existing, level=0).sort_index(axis=1, level=0).round(2)
+
+# ================= 2) df_box (reps + timestamps communs) =================
+def compute_box_spreads_nearest(bond_lists, carry_dataframes, yield_dataframes):
+    rows = []
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+
+    for country in country_list:
+        if country == benchmark_country: continue
+        for s,l in maturity_combinations:
+            if s not in reps[country] or l not in reps[country]: continue
+            if s not in reps[benchmark_country] or l not in reps[benchmark_country]: continue
+            bS, bL = reps[country][s], reps[country][l]
+            gS, gL = reps[benchmark_country][s], reps[benchmark_country][l]
+
+            s_cS, s_cL = f_carry[country][bS], f_carry[country][bL]
+            s_dS, s_dL = f_carry[benchmark_country][gS], f_carry[benchmark_country][gL]
+            vals, ts = last_common_value(s_cS, s_cL, s_dS, s_dL)
+            if ts is None or (today - pd.Timestamp(ts)).days > 7: continue
+            c_cS, c_cL, c_dS, c_dL = vals
+            carry_box = (c_cL - c_dL) - (c_cS - c_dS)
+
+            y_cS, y_cL = f_yield[country][bS], f_yield[country][bL]
+            y_dS, y_dL = f_yield[benchmark_country][gS], f_yield[benchmark_country][gL]
+            dates = y_cS.index & y_cL.index & y_dS.index & y_dL.index
+            y_box = ((y_cL.reindex(dates) - y_dL.reindex(dates)) - (y_cS.reindex(dates) - y_dS.reindex(dates))).dropna()*100.0
+            if len(y_box) < 40 or (today - pd.Timestamp(y_box.index[-1])).days > 7: continue
+            vol = y_box[-min(63,len(y_box)) :].std()
+            if pd.isna(vol) or vol==0: continue
+
+            # hist carry box
+            cL, cS = s_cL.dropna(), s_cS.dropna()
+            dL, dS = s_dL.dropna(), s_dS.dropna()
+            com = cL.index & cS.index & dL.index & dS.index
+            hist = ((cL.reindex(com)-dL.reindex(com)) - (cS.reindex(com)-dS.reindex(com))).dropna()
+            if len(hist)<40: continue
+            qwin = hist[-min(126,len(hist)):]
+            qs = qwin.quantile([0,.25,.5,.75,1])
+            wk = qwin.iloc[-8] if len(qwin)>=8 else np.nan
+
+            rows.append({
+                "Country": country, "Box": f"{s}s{l}s",
+                "Carry": carry_box, "Vol": vol, "CarryOverVol": carry_box/vol,
+                "Min": qs.iloc[0], "Q25": qs.iloc[1], "Q50": qs.iloc[2], "Q75": qs.iloc[3], "Max": qs.iloc[4],
+                "CarryOneWeekAgo": wk,
+                "Bond1_Short": bS, "Bond1_Long": bL, "Bond2_Short": gS, "Bond2_Long": gL, "TS": ts
+            })
+    return pd.DataFrame(rows)
+
+def remove_outliers_and_average_box(df_box: pd.DataFrame):
+    out = []
+    for (country, box), g in df_box.groupby(["Country","Box"]):
+        r = reduce_group_with_fallback(g, {"carry":"Carry","cov":"CarryOverVol"})
+        if isinstance(r, pd.Series):
+            out.append({
+                "Country": country, "Box": box,
+                "Carry": float(r.get("Carry", g["Carry"].mean())),
+                "Vol": float(r.get("Vol", g["Vol"].mean())),
+                "CarryOverVol": float(r.get("CarryOverVol", g["CarryOverVol"].mean())),
+                "Min": float(r.get("Min", g["Min"].mean())),
+                "Q25": float(r.get("Q25", g["Q25"].mean())),
+                "Q50": float(r.get("Q50", g["Q50"].mean())),
+                "Q75": float(r.get("Q75", g["Q75"].mean())),
+                "Max": float(r.get("Max", g["Max"].mean())),
+                "CarryOneWeekAgo": float(r.get("CarryOneWeekAgo", g["CarryOneWeekAgo"].mean())),
+            })
+    return pd.DataFrame(out)
+
+def pivot_box(best_box: pd.DataFrame, box_order=('2s10s','5s10s','2s30s','5s30s','10s30s','10s15s')):
+    if best_box.empty: return pd.DataFrame()
+    pivot_df = best_box.pivot(index='Country', columns='Box', values=['Carry','Vol'])
+    pivot_df.columns = pivot_df.columns.swaplevel(0,1)
+    existing = [b for b in box_order if b in pivot_df.columns.levels[0]]
+    return pivot_df.reindex(columns=existing, level=0).sort_index(axis=1, level=0).round(2)
+
+# ================= 3) df_outright (reps + ts local) =================
+def compute_outright(bond_lists, carry_dataframes, yield_dataframes):
+    rows = []
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+
+    for country in list(f_bonds.keys()):
+        for buck, b in reps[country].items():
+            s = f_carry[country][b].dropna()
+            if s.empty: continue
+            ts = s.index[-1]
+            if (today - pd.Timestamp(ts)).days > 7: continue
+            carry = float(s.loc[ts])
+
+            y = f_yield[country][b].dropna()
+            if len(y) < 40 or (today - pd.Timestamp(y.index[-1])).days > 7: continue
+            vol = (y[-min(63,len(y)):] * 100.0).std()
+            if pd.isna(vol) or vol==0: continue
+
+            qwin = s[-min(126,len(s)):]
+            qs = qwin.quantile([0,.25,.5,.75,1])
+            wk = s.iloc[-8] if len(s)>=8 else np.nan
+
+            rows.append({
+                "Country": country, "Maturity": buck, "Bond": b,
+                "Carry": carry, "Vol": vol, "CarryOverVol": carry/vol,
+                "Min": qs.iloc[0], "Q25": qs.iloc[1], "Q50": qs.iloc[2], "Q75": qs.iloc[3], "Max": qs.iloc[4],
+                "CarryOneWeekAgo": wk, "TS": ts
+            })
+    return pd.DataFrame(rows)
+
+def remove_outliers_and_average_outright(df_outright: pd.DataFrame):
+    out = []
+    for (country, m), g in df_outright.groupby(["Country","Maturity"]):
+        # fallback si tout négatif
+        pos = g[g["Carry"]>0]
+        use = pos if not pos.empty else g
+        if len(use)==1:
+            r = use.iloc[0]
+            out.append({
+                "Country": country, "Maturity": m,
+                "Carry": r["Carry"], "Vol": r["Vol"], "CarryOverVol": r["CarryOverVol"],
+                "Min": r["Min"], "Q25": r["Q25"], "Q50": r["Q50"], "Q75": r["Q75"],
+                "Max": r["Max"], "CarryOneWeekAgo": r["CarryOneWeekAgo"]
+            })
+        elif len(use)==2:
+            r = use.loc[use["CarryOverVol"].idxmax()]
+            out.append({
+                "Country": country, "Maturity": m,
+                "Carry": r["Carry"], "Vol": r["Vol"], "CarryOverVol": r["CarryOverVol"],
+                "Min": r["Min"], "Q25": r["Q25"], "Q50": r["Q50"], "Q75": r["Q75"],
+                "Max": r["Max"], "CarryOneWeekAgo": r["CarryOneWeekAgo"]
+            })
+        else:
+            mean_cov = use["CarryOverVol"].mean(); std_cov = use["CarryOverVol"].std(ddof=0)
+            fg = use[(use["CarryOverVol"] >= mean_cov - 1.5*std_cov) & (use["CarryOverVol"] <= mean_cov + 1.5*std_cov)]
+            if fg.empty: fg = use.loc[[use["CarryOverVol"].idxmax()]]
+            out.append({
+                "Country": country, "Maturity": m,
+                "Carry": fg["Carry"].mean(), "Vol": fg["Vol"].mean(), "CarryOverVol": fg["CarryOverVol"].mean(),
+                "Min": fg["Min"].mean(), "Q25": fg["Q25"].mean(), "Q50": fg["Q50"].mean(),
+                "Q75": fg["Q75"].mean(), "Max": fg["Max"].mean(), "CarryOneWeekAgo": fg["CarryOneWeekAgo"].mean()
+            })
+    return pd.DataFrame(out)
+
+def pivot_outright(best_outright: pd.DataFrame, maturity_order=(1,2,3,4,5,7,10,15,20,25,30)):
+    if best_outright.empty: return pd.DataFrame()
+    p = best_outright.pivot(index='Country', columns='Maturity', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    exist = [m for m in maturity_order if m in p.columns.levels[0]]
+    return p.reindex(columns=exist, level=0).sort_index(axis=1, level=0).round(2)
+
+# ================= 4) df_curve_outright (reps + ts commun L/S) =================
+def compute_curve_outright(bond_lists, carry_dataframes, yield_dataframes):
+    rows = []
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+
+    for country in list(f_bonds.keys()):
+        for s,l in maturity_combinations:
+            if s not in reps[country] or l not in reps[country]: continue
+            bS, bL = reps[country][s], reps[country][l]
+            sS, sL = f_carry[country][bS], f_carry[country][bL]
+            vals, ts = last_common_value(sS, sL)
+            if ts is None or (today - pd.Timestamp(ts)).days > 7: continue
+            carry_box = vals[1] - vals[0]
+
+            yS, yL = f_yield[country][bS], f_yield[country][bL]
+            dates = yS.index.intersection(yL.index)
+            ydiff = (yL.reindex(dates) - yS.reindex(dates)).dropna()*100.0
+            if len(ydiff) < 40 or (today - pd.Timestamp(ydiff.index[-1])).days > 7: continue
+            vol = ydiff[-min(63,len(ydiff)) :].std()
+            if pd.isna(vol) or vol==0: continue
+
+            hist = (sL.dropna().reindex(dates) - sS.dropna().reindex(dates)).dropna()
+            if len(hist) < 40: continue
+            qwin = hist[-min(126,len(hist)):]
+            qs = qwin.quantile([0,.25,.5,.75,1])
+            wk = qwin.iloc[-8] if len(qwin)>=8 else np.nan
+
+            rows.append({
+                "Country": country, "Box": f"{s}s{l}s",
+                "Carry": carry_box, "Vol": vol, "CarryOverVol": carry_box/vol,
+                "Min": qs.iloc[0], "Q25": qs.iloc[1], "Q50": qs.iloc[2], "Q75": qs.iloc[3], "Max": qs.iloc[4],
+                "CarryOneWeekAgo": wk, "Bond_Short": bS, "Bond_Long": bL, "TS": ts
+            })
+    return pd.DataFrame(rows)
+
+def remove_outliers_and_average_curve(df_curve_outright: pd.DataFrame):
+    out = []
+    for (country, box), g in df_curve_outright.groupby(["Country","Box"]):
+        r = reduce_group_with_fallback(g, {"carry":"Carry","cov":"CarryOverVol"})
+        if isinstance(r, pd.Series):
+            out.append({
+                "Country": country, "Box": box,
+                "Carry": float(r.get("Carry", g["Carry"].mean())),
+                "Vol": float(r.get("Vol", g["Vol"].mean())),
+                "CarryOverVol": float(r.get("CarryOverVol", g["CarryOverVol"].mean())),
+                "Min": float(r.get("Min", g["Min"].mean())),
+                "Q25": float(r.get("Q25", g["Q25"].mean())),
+                "Q50": float(r.get("Q50", g["Q50"].mean())),
+                "Q75": float(r.get("Q75", g["Q75"].mean())),
+                "Max": float(r.get("Max", g["Max"].mean())),
+                "CarryOneWeekAgo": float(r.get("CarryOneWeekAgo", g["CarryOneWeekAgo"].mean())),
+            })
+    return pd.DataFrame(out)
+
+def pivot_curve_outright(best_curve: pd.DataFrame, box_order=('2s10s','5s10s','2s30s','5s30s','10s30s','10s15s')):
+    if best_curve.empty: return pd.DataFrame()
+    p = best_curve.pivot(index='Country', columns='Box', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    exist = [b for b in box_order if b in p.columns.levels[0]]
+    return p.reindex(columns=exist, level=0).sort_index(axis=1, level=0).round(2)
+
+# ================= 5) df_fly_box (reps + ts commun 3 legs) =================
+def compute_fly_box_spreads_nearest(bond_lists, carry_dataframes, yield_dataframes):
+    rows = []
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+
+    for country in country_list:
+        if country == benchmark_country: continue
+        for s,m,l in fly_combinations:
+            if s not in reps[country] or m not in reps[country] or l not in reps[country]: continue
+            if s not in reps[benchmark_country] or m not in reps[benchmark_country] or l not in reps[benchmark_country]: continue
+            bS,bM,bL = reps[country][s], reps[country][m], reps[country][l]
+            gS,gM,gL = reps[benchmark_country][s], reps[benchmark_country][m], reps[benchmark_country][l]
+            W = fly_weights(s,m,l)
+
+            vals, ts = last_common_value(f_carry[country][bS], f_carry[country][bM], f_carry[country][bL],
+                                         f_carry[benchmark_country][gS], f_carry[benchmark_country][gM], f_carry[benchmark_country][gL])
+            if ts is None or (today - pd.Timestamp(ts)).days > 7: continue
+            cS,cM,cL, dS,dM,dL = vals
+            carry_fly = (W[s]*cS + W[m]*cM + W[l]*cL) - (W[s]*dS + W[m]*dM + W[l]*dL)
+
+            ycS,ycM,ycL = f_yield[country][bS], f_yield[country][bM], f_yield[country][bL]
+            ydS,ydM,ydL = f_yield[benchmark_country][gS], f_yield[benchmark_country][gM], f_yield[benchmark_country][gL]
+            dates = ycS.index & ycM.index & ycL.index & ydS.index & ydM.index & ydL.index
+            y_fly = (W[s]*(ycS-ydS) + W[m]*(ycM-ydM) + W[l]*(ycL-ydL)).reindex(dates).dropna()*100.0
+            if len(y_fly) < 40 or (today - pd.Timestamp(y_fly.index[-1])).days > 7: continue
+            vol = y_fly[-min(63,len(y_fly)) :].std()
+            if pd.isna(vol) or vol==0: continue
+
+            # hist carry fly box
+            ccS,ccM,ccL = f_carry[country][bS].dropna(), f_carry[country][bM].dropna(), f_carry[country][bL].dropna()
+            ddS,ddM,ddL = f_carry[benchmark_country][gS].dropna(), f_carry[benchmark_country][gM].dropna(), f_carry[benchmark_country][gL].dropna()
+            com_c = ccS.index & ccM.index & ccL.index
+            com_d = ddS.index & ddM.index & ddL.index
+            fc = (W[s]*ccS.reindex(com_c) + W[m]*ccM.reindex(com_c) + W[l]*ccL.reindex(com_c)).dropna()
+            fd = (W[s]*ddS.reindex(com_d) + W[m]*ddM.reindex(com_d) + W[l]*ddL.reindex(com_d)).dropna()
+            com = fc.index.intersection(fd.index)
+            hist = (fc.reindex(com) - fd.reindex(com)).dropna()
+            if len(hist)<40: continue
+            qwin = hist[-min(126,len(hist)):]
+            qs = qwin.quantile([0,.25,.5,.75,1]); wk = qwin.iloc[-8] if len(qwin)>=8 else np.nan
+
+            rows.append({
+                "Country": country, "Fly": f"{s}s{m}s{l}s",
+                "Carry": carry_fly, "Vol": vol, "CarryOverVol": carry_fly/vol,
+                "Min": qs.iloc[0], "Q25": qs.iloc[1], "Q50": qs.iloc[2], "Q75": qs.iloc[3], "Max": qs.iloc[4],
+                "CarryOneWeekAgo": wk,
+                "Bond_Short": bS, "Bond_Belly": bM, "Bond_Long": bL,
+                "DE_Short": gS, "DE_Belly": gM, "DE_Long": gL, "TS": ts
+            })
+    return pd.DataFrame(rows)
+
+def remove_outliers_and_average_fly_box(df_fly_box: pd.DataFrame):
+    out = []
+    for (country, fly), g in df_fly_box.groupby(["Country","Fly"]):
+        r = reduce_group_with_fallback(g, {"carry":"Carry","cov":"CarryOverVol"})
+        if isinstance(r, pd.Series):
+            out.append({
+                "Country": country, "Fly": fly,
+                "Carry": float(r.get("Carry", g["Carry"].mean())),
+                "Vol": float(r.get("Vol", g["Vol"].mean())),
+                "CarryOverVol": float(r.get("CarryOverVol", g["CarryOverVol"].mean())),
+                "Min": float(r.get("Min", g["Min"].mean())),
+                "Q25": float(r.get("Q25", g["Q25"].mean())),
+                "Q50": float(r.get("Q50", g["Q50"].mean())),
+                "Q75": float(r.get("Q75", g["Q75"].mean())),
+                "Max": float(r.get("Max", g["Max"].mean())),
+                "CarryOneWeekAgo": float(r.get("CarryOneWeekAgo", g["CarryOneWeekAgo"].mean())),
+            })
+    return pd.DataFrame(out)
+
+def pivot_fly_box(best_fly_box: pd.DataFrame, fly_order=('2s5s10s','5s7s10s','10s15s30s','5s10s30s')):
+    if best_fly_box.empty: return pd.DataFrame()
+    p = best_fly_box.pivot(index='Country', columns='Fly', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    exist = [f for f in fly_order if f in p.columns.levels[0]]
+    return p.reindex(columns=exist, level=0).sort_index(axis=1, level=0).round(2)
+
+# ================= 6) df_fly_outright (reps + ts commun 3 legs) =================
+def compute_fly_outright(bond_lists, carry_dataframes, yield_dataframes):
+    rows = []
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+
+    for country in list(f_bonds.keys()):
+        for s,m,l in fly_combinations:
+            if s not in reps[country] or m not in reps[country] or l not in reps[country]: continue
+            bS,bM,bL = reps[country][s], reps[country][m], reps[country][l]
+            W = fly_weights(s,m,l)
+
+            vals, ts = last_common_value(f_carry[country][bS], f_carry[country][bM], f_carry[country][bL])
+            if ts is None or (today - pd.Timestamp(ts)).days > 7: continue
+            cS,cM,cL = vals
+            carry_fly = W[s]*cS + W[m]*cM + W[l]*cL
+
+            ys, ym, yl = f_yield[country][bS], f_yield[country][bM], f_yield[country][bL]
+            dates = ys.index & ym.index & yl.index
+            y_fly = (W[s]*ys.reindex(dates) + W[m]*ym.reindex(dates) + W[l]*yl.reindex(dates)).dropna()*100.0
+            if len(y_fly)<40 or (today - pd.Timestamp(y_fly.index[-1])).days > 7: continue
+            vol = y_fly[-min(63,len(y_fly)):].std()
+            if pd.isna(vol) or vol==0: continue
+
+            cs, cm, cl = f_carry[country][bS].dropna(), f_carry[country][bM].dropna(), f_carry[country][bL].dropna()
+            com = cs.index & cm.index & cl.index
+            hist = (W[s]*cs.reindex(com) + W[m]*cm.reindex(com) + W[l]*cl.reindex(com)).dropna()
+            if len(hist)<40: continue
+            qwin = hist[-min(126,len(hist)):]
+            qs = qwin.quantile([0,.25,.5,.75,1]); wk = qwin.iloc[-8] if len(qwin)>=8 else np.nan
+
+            rows.append({
+                "Country": country, "Fly": f"{s}s{m}s{l}s",
+                "Carry": carry_fly, "Vol": vol, "CarryOverVol": carry_fly/vol,
+                "Min": qs.iloc[0], "Q25": qs.iloc[1], "Q50": qs.iloc[2], "Q75": qs.iloc[3], "Max": qs.iloc[4],
+                "CarryOneWeekAgo": wk,
+                "Bond_Short": bS, "Bond_Belly": bM, "Bond_Long": bL, "TS": ts
+            })
+    return pd.DataFrame(rows)
+
+def remove_outliers_and_average_fly_outright(df_fly_outright: pd.DataFrame):
+    out = []
+    for (country, fly), g in df_fly_outright.groupby(["Country","Fly"]):
+        r = reduce_group_with_fallback(g, {"carry":"Carry","cov":"CarryOverVol"})
+        if isinstance(r, pd.Series):
+            out.append({
+                "Country": country, "Fly": fly,
+                "Carry": float(r.get("Carry", g["Carry"].mean())),
+                "Vol": float(r.get("Vol", g["Vol"].mean())),
+                "CarryOverVol": float(r.get("CarryOverVol", g["CarryOverVol"].mean())),
+                "Min": float(r.get("Min", g["Min"].mean())),
+                "Q25": float(r.get("Q25", g["Q25"].mean())),
+                "Q50": float(r.get("Q50", g["Q50"].mean())),
+                "Q75": float(r.get("Q75", g["Q75"].mean())),
+                "Max": float(r.get("Max", g["Max"].mean())),
+                "CarryOneWeekAgo": float(r.get("CarryOneWeekAgo", g["CarryOneWeekAgo"].mean())),
+            })
+    return pd.DataFrame(out)
+
+def pivot_fly_outright(best_fly_out: pd.DataFrame, fly_order=('2s5s10s','5s7s10s','10s15s30s','5s10s30s')):
+    if best_fly_out.empty: return pd.DataFrame()
+    p = best_fly_out.pivot(index='Country', columns='Fly', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    exist = [f for f in fly_order if f in p.columns.levels[0]]
+    return p.reindex(columns=exist, level=0).sort_index(axis=1, level=0).round(2)
+
+
+
+# =========================
+# SOLUTION B — Dérivation depuis pivot_outright
+# =========================
+
+def derive_carry_spread_from_outright(pivot_out: pd.DataFrame, maturity_order=(1,2,3,4,5,7,10,15,20,25,30)):
+    # pivot_out: level0=maturity, level1=('Carry','Vol')
+    countries = pivot_out.index.tolist()
+    if benchmark_country not in countries: return pd.DataFrame()
+    out = {}
+    for m in pivot_out.columns.levels[0]:
+        if ('Carry', m) not in pivot_out.columns: continue
+        out[m] = pivot_out[ (m, 'Carry') ] - pivot_out.loc[benchmark_country, (m,'Carry')]
+    df = pd.DataFrame(out)
+    df = df.reindex(columns=[m for m in maturity_order if m in df.columns])
+    return df  # Carry only
+
+def derive_carry_curve_from_outright(pivot_out: pd.DataFrame, combos=maturity_combinations):
+    # retourne DataFrame Carry curve by box (2s10s etc.)
+    out = {}
+    for s,l in combos:
+        if (s,'Carry') in pivot_out.columns and (l,'Carry') in pivot_out.columns:
+            out[f"{s}s{l}s"] = pivot_out[(l,'Carry')] - pivot_out[(s,'Carry')]
+    return pd.DataFrame(out)
+
+def derive_carry_fly_from_outright(pivot_out: pd.DataFrame, combos=fly_combinations):
+    out = {}
+    for s,m,l in combos:
+        ok = all((k,'Carry') in pivot_out.columns for k in [s,m,l])
+        if not ok: continue
+        out[f"{s}s{m}s{l}s"] = 2*pivot_out[(m,'Carry')] - pivot_out[(s,'Carry')] - pivot_out[(l,'Carry')]
+    return pd.DataFrame(out)
+
+# vols ex-post via yields (mêmes représentants que A)
+def rebuild_vol_for_spread_from_reps(df_spread_carry_only, bond_lists, carry_dataframes, yield_dataframes):
+    f_bonds, f_carry, f_yield = prepare_filtered_inputs(bond_lists, carry_dataframes, yield_dataframes)
+    reps = select_representatives(f_bonds, f_carry, f_yield)
+    rows = []
+    for country in df_spread_carry_only.index:
+        if country == benchmark_country: continue
+        for m in df_spread_carry_only.columns:
+            if m not in reps[country] or m not in reps[benchmark_country]: continue
+            b_c = reps[country][m]; b_d = reps[benchmark_country][m]
+            y_c, y_d = f_yield[country][b_c], f_yield[benchmark_country][b_d]
+            dates = y_c.index.intersection(y_d.index)
+            yd = (y_c.reindex(dates) - y_d.reindex(dates)).dropna()*100.0
+            if len(yd) < 40 or (today - pd.Timestamp(yd.index[-1])).days > 7: continue
+            vol = yd[-min(63,len(yd)) :].std()
+            rows.append({"Country": country, "Bucket": m, "CarrySpread": df_spread_carry_only.loc[country,m], "Vol": vol})
+    if not rows: return pd.DataFrame()
+    best = pd.DataFrame(rows)
+    # construire pivot (CarrySpread, Vol)
+    p = best.pivot(index='Country', columns='Bucket', values=['CarrySpread','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    return p.sort_index(axis=1, level=0).round(2)
+
+# Exemple d’utilisation après avoir obtenu pivot_outright (Solution A)
+# pivot_out = pivot_outright(best_outright)
+# spreads_carry = derive_carry_spread_from_outright(pivot_out)
+# pivot_spread_from_out = rebuild_vol_for_spread_from_reps(spreads_carry, bond_lists, carry_dataframes, yield_dataframes)
+
+# Pour curve & fly outright dérivés (Carry seulement) :
+# pivot_curve_from_out = derive_carry_curve_from_outright(pivot_out)
+# pivot_fly_from_out   = derive_carry_fly_from_outright(pivot_out)
+
+# Pour boxes/fly-box dérivés (Carry seulement) : 
+#   box(country) = curve(country) - curve(Germany)
+#   flybox(country) = fly(country) - fly(Germany)
+# => tu peux appliquer la même logique que spreads_carry ci-dessus pour construire des pivots Carry,
+#    puis recalculer les Vol ex-post en utilisant les différentiels de yields correspondants (exactement comme rebuild_vol_for_spread_from_reps).
+
+
+
+
+#
