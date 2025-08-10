@@ -1,1 +1,480 @@
+# =========================================
+# EMAIL "Carry Summaries" — HTML 2 colonnes, images inline (pas de pièces jointes)
+# Compatible Outlook/Exchange (taille fixe, pas de bbox='tight')
+# Inclut un fallback si le scatter est "blanc"
+# =========================================
+import smtplib, uuid
+from io import BytesIO
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# =============================
+# 0) PARAMS D'IMAGERIE (pixels fixes pour éviter le crop d'Outlook)
+# =============================
+_DEF_DPI       = 160
+_COL_WIDTH_PX  = 640     # largeur d'une colonne
+_ASPECT_SCAT   = 0.62    # scatter un peu plus haut
+_ASPECT_CANDLE = 0.56    # candlestick un peu plus compact
+
+def _prepare_fig_for_email(fig, px_width, aspect, dpi=_DEF_DPI):
+    """Dimensionne et 'tight_layout' sans bbox='tight' pour éviter le crop côté client mail."""
+    px_height = int(round(px_width * aspect))
+    fig.set_dpi(dpi)
+    fig.set_size_inches(px_width / dpi, px_height / dpi)
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+    return px_width, px_height
+
+def _capture_current_figure():
+    """Récupère la figure courante puis la ferme (évite la double ouverture dans des notebooks)."""
+    fig = plt.gcf()
+    plt.close(fig)
+    return fig
+
+# =============================
+# 1) WRAPPERS PLOTS (réutilisent TES fonctions)
+#    + fallback robuste si le scatter ressort "blanc"
+# =============================
+
+def _fallback_scatter_from_df(raw_df, title):
+    """Plan B si le scatter utilisateur n'a rien dessiné : on trace Vol vs Carry/CarrySpread simplement."""
+    # choix de la colonne Y
+    y_col = 'Carry' if 'Carry' in raw_df.columns else ('CarrySpread' if 'CarrySpread' in raw_df.columns else None)
+    if y_col is None or 'Vol' not in raw_df.columns:
+        # rien à faire -> placeholder
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, "No data", ha='center', va='center', fontsize=12, transform=ax.transAxes)
+        ax.set_axis_off()
+        return _capture_current_figure()
+
+    df = raw_df[['Vol', y_col]].dropna().copy()
+    # évite le scatter vide
+    if df.empty:
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, "No data", ha='center', va='center', fontsize=12, transform=ax.transAxes)
+        ax.set_axis_off()
+        return _capture_current_figure()
+
+    # filtre léger, conserve seulement carry > 0 (comme demandé) et vol > 0
+    df = df[(df['Vol'] > 0) & (df[y_col] > 0)]
+    if df.empty:
+        # si rien de positif, on montre quand même quelque chose
+        df = raw_df[['Vol', y_col]].dropna().copy()
+
+    fig, ax = plt.subplots()
+    ax.scatter(df['Vol'], df[y_col], marker='D', s=30, linewidths=0.5, edgecolors='black')
+    ax.axhline(0, color='grey', linewidth=0.8)
+    ax.axvline(0, color='grey', linewidth=0.8)
+    ax.grid(True, alpha=0.25)
+    ax.set_title(title)
+    ax.set_xlabel("Delivered vol (bp)")
+    ax.set_ylabel("Carry (bp)")
+    # petites marges automatiques
+    try:
+        x = df['Vol'].values
+        y = df[y_col].values
+        if np.isfinite(x).any() and np.isfinite(y).any():
+            xm, xM = np.nanmin(x), np.nanmax(x)
+            ym, yM = np.nanmin(y), np.nanmax(y)
+            dx = (xM - xm) * 0.07 if xM > xm else 1.0
+            dy = (yM - ym) * 0.15 if yM > ym else 1.0
+            ax.set_xlim(xm - dx, xM + dx)
+            ax.set_ylim(ym - dy, yM + dy)
+    except Exception:
+        pass
+
+    return _capture_current_figure()
+
+def _figure_has_content(fig):
+    """Détecte si la figure a des objets (lignes/collections/images) → sinon on la considère vide."""
+    if fig is None or not fig.axes:
+        return False
+    for ax in fig.axes:
+        if (ax.lines and len(ax.lines) > 0) or (ax.collections and len(ax.collections) > 0) or (ax.images and len(ax.images) > 0):
+            return True
+    return False
+
+# ---- SCATTERS : on appelle TON _plot_scatter_generic puis on fallback si besoin ----
+def scatter_figure_outright(df_outright):
+    # essai avec ta fonction
+    try:
+        _plot_scatter_generic(df_outright, key_col='Maturity', dataset_name='outright',
+                              title="Outright — Carry (y) vs Delivered Vol (x)")
+        fig = _capture_current_figure()
+        if not _figure_has_content(fig):
+            raise RuntimeError("empty scatter")
+    except Exception:
+        # fallback simple mais robuste
+        fig = _fallback_scatter_from_df(df_outright, "Outright — Carry (y) vs Delivered Vol (x)")
+    return fig
+
+def scatter_figure_spread(df_spread):
+    try:
+        _plot_scatter_generic(df_spread, key_col='Maturity', dataset_name='spread',
+                              title="Spreads vs Germany — Carry (y) vs Delivered Vol (x)")
+        fig = _capture_current_figure()
+        if not _figure_has_content(fig):
+            raise RuntimeError("empty scatter")
+    except Exception:
+        fig = _fallback_scatter_from_df(df_spread, "Spreads vs Germany — Carry (y) vs Delivered Vol (x)")
+    return fig
+
+def scatter_figure_box_outright(df_curve):
+    try:
+        _plot_scatter_generic(df_curve, key_col='Box', dataset_name='curve_outright',
+                              title="Curve Outright — Carry (y) vs Delivered Vol (x)")
+        fig = _capture_current_figure()
+        if not _figure_has_content(fig):
+            raise RuntimeError("empty scatter")
+    except Exception:
+        fig = _fallback_scatter_from_df(df_curve, "Curve Outright — Carry (y) vs Delivered Vol (x)")
+    return fig
+
+def scatter_figure_box_vs(df_box):
+    try:
+        _plot_scatter_generic(df_box, key_col='Box', dataset_name='box',
+                              title="Box vs Germany — Carry (y) vs Delivered Vol (x)")
+        fig = _capture_current_figure()
+        if not _figure_has_content(fig):
+            raise RuntimeError("empty scatter")
+    except Exception:
+        fig = _fallback_scatter_from_df(df_box, "Box vs Germany — Carry (y) vs Delivered Vol (x)")
+    return fig
+
+def scatter_figure_fly_outright(df_fly_out):
+    try:
+        _plot_scatter_generic(df_fly_out, key_col='Fly', dataset_name='fly_outright',
+                              title="Fly Outright — Carry (y) vs Delivered Vol (x)")
+        fig = _capture_current_figure()
+        if not _figure_has_content(fig):
+            raise RuntimeError("empty scatter")
+    except Exception:
+        fig = _fallback_scatter_from_df(df_fly_out, "Fly Outright — Carry (y) vs Delivered Vol (x)")
+    return fig
+
+def scatter_figure_fly_vs(df_fly_box):
+    try:
+        _plot_scatter_generic(df_fly_box, key_col='Fly', dataset_name='fly_box',
+                              title="Fly vs Germany — Carry (y) vs Delivered Vol (x)")
+        fig = _capture_current_figure()
+        if not _figure_has_content(fig):
+            raise RuntimeError("empty scatter")
+    except Exception:
+        fig = _fallback_scatter_from_df(df_fly_box, "Fly vs Germany — Carry (y) vs Delivered Vol (x)")
+    return fig
+
+# ---- CANDLESTICKS : on réutilise TON _draw_candles ----
+def candlestick_figs_outright(df_outright, countries=("France","Italy","Spain")):
+    figs=[]
+    df = df_outright.rename(columns={'Maturity':'Bucket'}) if 'Maturity' in df_outright.columns else df_outright
+    for c in countries:
+        sub = df[df['Country']==c]
+        if sub.empty: continue
+        fig, ax = plt.subplots()
+        _draw_candles(ax, sub, x_key='Bucket', x_is_bucket=True,
+                      title=f"{c} — Outright", xlabel="Maturity Buckets")
+        figs.append(_capture_current_figure())
+    return figs
+
+def candlestick_figs_spread(df_spread, countries=("France","Italy","Spain"), benchmark="Germany"):
+    figs=[]
+    df = df_spread.rename(columns={'Maturity':'Bucket'}) if 'Maturity' in df_spread.columns else df_spread
+    for c in countries:
+        pair = f"{c}-{benchmark}"
+        sub = df[df['CountryPair']==pair]
+        if sub.empty: continue
+        fig, ax = plt.subplots()
+        _draw_candles(ax, sub, x_key='Bucket', x_is_bucket=True,
+                      title=f"{c} — Spread vs Germany", xlabel="Maturity Buckets")
+        figs.append(_capture_current_figure())
+    return figs
+
+def candlestick_figs_box_outright(df_curve, countries=("France","Italy","Spain")):
+    figs=[]
+    for c in countries:
+        sub = df_curve[df_curve['Country']==c]
+        if sub.empty: continue
+        fig, ax = plt.subplots()
+        _draw_candles(ax, sub, x_key='Box', x_is_bucket=False,
+                      title=f"{c} — Curve Outright", xlabel="Boxes")
+        figs.append(_capture_current_figure())
+    return figs
+
+def candlestick_figs_box_vs(df_box, countries=("France","Italy","Spain")):
+    figs=[]
+    for c in countries:
+        sub = df_box[df_box['Country']==c]
+        if sub.empty: continue
+        fig, ax = plt.subplots()
+        _draw_candles(ax, sub, x_key='Box', x_is_bucket=False,
+                      title=f"{c} — Box vs Germany", xlabel="Boxes")
+        figs.append(_capture_current_figure())
+    return figs
+
+def candlestick_figs_fly_outright(df_fly_out, countries=("France","Italy","Spain")):
+    figs=[]
+    for c in countries:
+        sub = df_fly_out[df_fly_out['Country']==c]
+        if sub.empty: continue
+        fig, ax = plt.subplots()
+        _draw_candles(ax, sub, x_key='Fly', x_is_bucket=False,
+                      title=f"{c} — Fly Outright", xlabel="Flies")
+        figs.append(_capture_current_figure())
+    return figs
+
+def candlestick_figs_fly_vs(df_fly_box, countries=("France","Italy","Spain")):
+    figs=[]
+    for c in countries:
+        sub = df_fly_box[df_fly_box['Country']==c]
+        if sub.empty: continue
+        fig, ax = plt.subplots()
+        _draw_candles(ax, sub, x_key='Fly', x_is_bucket=False,
+                      title=f"{c} — Fly vs Germany", xlabel="Flies")
+        figs.append(_capture_current_figure())
+    return figs
+
+# =============================
+# 2) HTML HELPERS
+# =============================
+def _df_to_html_table(df: pd.DataFrame, caption=None, max_rows=40, max_cols=20):
+    if df is None or len(df)==0:
+        return "<div style='font-style:italic;color:#666'>No data</div>"
+    d = df.copy()
+    if d.shape[0] > max_rows:
+        d = pd.concat([d.head(max_rows),
+                       pd.DataFrame([["..."]*d.shape[1]], columns=d.columns)], axis=0)
+    if d.shape[1] > max_cols:
+        d = d.iloc[:, :max_cols]
+    html = d.to_html(border=1, index=True, justify='center')
+    if caption:
+        html = f"<div style='font:600 12px Arial;margin:6px 0 4px'>{caption}</div>{html}"
+    # table compacte & fixe pour rester dans la colonne
+    html = html.replace("<table", "<table style='table-layout:fixed;border-collapse:collapse;font:10px Arial;width:100%'")
+    html = html.replace("<th>", "<th style='padding:3px 5px;background:#f2f2f2;border:1px solid #ddd;word-wrap:break-word'>")
+    html = html.replace("<td>", "<td style='padding:2px 4px;border:1px solid #eee;word-wrap:break-word'>")
+    return html
+
+def _fig_to_cid_inline(root_msg, fig, cid_hint, px_width, aspect):
+    """Attache l'image en inline (sans filename) et renvoie (cid, w, h).
+       Ne met PAS Content-Disposition: attachment → évite l’apparition en pièce jointe.
+    """
+    if fig is None:
+        return "", 0, 0
+    w, h = _prepare_fig_for_email(fig, px_width=px_width, aspect=aspect, dpi=_DEF_DPI)
+    buf = BytesIO()
+    fig.savefig(buf, format='png', dpi=_DEF_DPI)  # surtout pas bbox='tight'
+    buf.seek(0)
+    img = MIMEImage(buf.read(), _subtype='png')
+    cid = f"{cid_hint}-{uuid.uuid4().hex}@carry"
+    img.add_header('Content-ID', f"<{cid}>")
+    # PAS de filename, PAS de Content-Disposition -> inline only
+    root_msg.attach(img)
+    return cid, w, h
+
+def _img_tag(cid, width_px, height_px):
+    return f"<img src='cid:{cid}' width='{width_px}' height='{height_px}' style='display:block;margin:8px 0'>"
+
+def _col_html(title, table_html, scatter_img_html, cand_img_htmls):
+    return f"""
+    <div style="padding:10px">
+      <div style="font:700 14px Arial;margin:0 0 6px 0">{title}</div>
+      {table_html}
+      {scatter_img_html}
+      {''.join(cand_img_htmls)}
+    </div>"""
+
+def _two_col_row(left_html, right_html):
+    return f"""
+    <tr>
+      <td valign="top" width="50%" style="border-right:1px solid #e6e6e6">{left_html}</td>
+      <td valign="top" width="50%">{right_html}</td>
+    </tr>"""
+
+# =============================
+# 3) BUILD (tables + figs) À PARTIR DE TES DFS
+# =============================
+def build_all_carry_figs_and_tables(
+    best_outright, best_spread, best_curve, best_box, best_fly_out, best_fly_box,
+    pivot_df_out, pivot_df_spread, pivot_df_curve, pivot_df_box, pivot_df_fly_out, pivot_df_fly_box,
+    countries=("France","Italy","Spain")
+):
+    # scatters (avec fallback anti-blanc)
+    fig_sc_out   = scatter_figure_outright(best_outright)
+    fig_sc_sp    = scatter_figure_spread(best_spread)
+    fig_sc_box_o = scatter_figure_box_outright(best_curve)
+    fig_sc_box_v = scatter_figure_box_vs(best_box)
+    fig_sc_fly_o = scatter_figure_fly_outright(best_fly_out)
+    fig_sc_fly_v = scatter_figure_fly_vs(best_fly_box)
+
+    # candlesticks (3 par côté si pays présents)
+    figs_out     = candlestick_figs_outright(best_outright, countries=countries)
+    figs_spread  = candlestick_figs_spread(best_spread, countries=countries)
+    figs_box_out = candlestick_figs_box_outright(best_curve, countries=countries)
+    figs_box_vs  = candlestick_figs_box_vs(best_box, countries=countries)
+    figs_fly_out = candlestick_figs_fly_outright(best_fly_out, countries=countries)
+    figs_fly_vs  = candlestick_figs_fly_vs(best_fly_box, countries=countries)
+
+    # tables html (pivots)
+    tables = dict(
+        t_out     = _df_to_html_table(pivot_df_out,     caption="Pivot — Outright"),
+        t_spread  = _df_to_html_table(pivot_df_spread,  caption="Pivot — Spread vs Germany"),
+        t_box_out = _df_to_html_table(pivot_df_curve,   caption="Pivot — Curve Outright (Box)"),
+        t_box_vs  = _df_to_html_table(pivot_df_box,     caption="Pivot — Box vs Germany"),
+        t_fly_out = _df_to_html_table(pivot_df_fly_out, caption="Pivot — Fly Outright"),
+        t_fly_vs  = _df_to_html_table(pivot_df_fly_box, caption="Pivot — Fly vs Germany"),
+    )
+
+    figs = dict(
+        sc_out=fig_sc_out, sc_sp=fig_sc_sp,
+        sc_box_o=fig_sc_box_o, sc_box_v=fig_sc_box_v,
+        sc_fly_o=fig_sc_fly_o, sc_fly_v=fig_sc_fly_v,
+        cand_out=figs_out, cand_sp=figs_spread,
+        cand_box_o=figs_box_out, cand_box_v=figs_box_vs,
+        cand_fly_o=figs_fly_out, cand_fly_v=figs_fly_vs,
+    )
+    return tables, figs
+
+# =============================
+# 4) ENVOI DU MAIL (tout inline)
+# =============================
+def send_carry_email_using_your_vars(
+    to_list,
+    best_outright, best_spread, best_curve, best_box, best_fly_out, best_fly_box,
+    pivot_df_out, pivot_df_spread, pivot_df_curve, pivot_df_box, pivot_df_fly_out, pivot_df_fly_box,
+    sender="your.email@jpmorgan.com",
+    subject="Carry Summaries",
+    countries=("France","Italy","Spain")
+):
+    tables, figs = build_all_carry_figs_and_tables(
+        best_outright, best_spread, best_curve, best_box, best_fly_out, best_fly_box,
+        pivot_df_out, pivot_df_spread, pivot_df_curve, pivot_df_box, pivot_df_fly_out, pivot_df_fly_box,
+        countries=countries
+    )
+
+    # Multipart/related + alternative (HTML + plain)
+    root = MIMEMultipart('related')
+    root['Subject'] = subject
+    root['From']    = sender
+    root['To']      = ", ".join(to_list)
+    alt  = MIMEMultipart('alternative')
+    root.attach(alt)
+
+    # -- Attache toutes les images (INLINE) et génère les <img> tag avec taille fixe
+    def add_img(fig, hint, aspect):
+        cid, w, h = _fig_to_cid_inline(root, fig, hint, px_width=_COL_WIDTH_PX, aspect=aspect)
+        return _img_tag(cid, w, h) if cid else ""
+
+    # scatters
+    sc_out_img   = add_img(figs['sc_out'],   "sc_out",   _ASPECT_SCAT)
+    sc_sp_img    = add_img(figs['sc_sp'],    "sc_sp",    _ASPECT_SCAT)
+    sc_box_o_img = add_img(figs['sc_box_o'], "sc_box_o", _ASPECT_SCAT)
+    sc_box_v_img = add_img(figs['sc_box_v'], "sc_box_v", _ASPECT_SCAT)
+    sc_fly_o_img = add_img(figs['sc_fly_o'], "sc_fly_o", _ASPECT_SCAT)
+    sc_fly_v_img = add_img(figs['sc_fly_v'], "sc_fly_v", _ASPECT_SCAT)
+
+    # candlesticks (3 par côté en général)
+    cand_out_imgs   = [add_img(f, f"cand_out_{i+1}",   _ASPECT_CANDLE) for i, f in enumerate(figs['cand_out']   or [])]
+    cand_sp_imgs    = [add_img(f, f"cand_sp_{i+1}",    _ASPECT_CANDLE) for i, f in enumerate(figs['cand_sp']    or [])]
+    cand_box_o_imgs = [add_img(f, f"cand_box_o_{i+1}", _ASPECT_CANDLE) for i, f in enumerate(figs['cand_box_o'] or [])]
+    cand_box_v_imgs = [add_img(f, f"cand_box_v_{i+1}", _ASPECT_CANDLE) for i, f in enumerate(figs['cand_box_v'] or [])]
+    cand_fly_o_imgs = [add_img(f, f"cand_fly_o_{i+1}", _ASPECT_CANDLE) for i, f in enumerate(figs['cand_fly_o'] or [])]
+    cand_fly_v_imgs = [add_img(f, f"cand_fly_v_{i+1}", _ASPECT_CANDLE) for i, f in enumerate(figs['cand_fly_v'] or [])]
+
+    # Colonnes (dans l’ordre demandé : table -> scatter -> 3 candlesticks)
+    left1  = _col_html("Outright",             tables['t_out'],    sc_out_img,   cand_out_imgs)
+    right1 = _col_html("Spread vs Germany",    tables['t_spread'], sc_sp_img,    cand_sp_imgs)
+    left2  = _col_html("Curve Outright (Box)", tables['t_box_out'], sc_box_o_img, cand_box_o_imgs)
+    right2 = _col_html("Box vs Germany",       tables['t_box_vs'],  sc_box_v_img, cand_box_v_imgs)
+    left3  = _col_html("Fly Outright",         tables['t_fly_out'], sc_fly_o_img, cand_fly_o_imgs)
+    right3 = _col_html("Fly vs Germany",       tables['t_fly_vs'],  sc_fly_v_img, cand_fly_v_imgs)
+
+    row1 = _two_col_row(left1, right1)
+    row2 = _two_col_row(left2, right2)
+    row3 = _two_col_row(left3, right3)
+
+    intro = """
+    <div style="font:13px Arial">
+      Hello Team,<br><br>
+      Please find below the Carry Analysis.<br><br>
+    </div>
+    """
+
+    # conteneur 1320 px → 2 colonnes de ~660 px → nos images de 640 px rentrent sans crop
+    html_body = f"""
+    <html>
+      <body style="margin:0;padding:0;background:#fff">
+        <center>
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="1320"
+               style="border-collapse:collapse;font:13px Arial">
+          <tr><td colspan="2" style="padding:0 10px">{intro}</td></tr>
+
+          <tr>
+            <td colspan="2" style="font:700 16px Arial;padding:6px 10px;background:#f7f7f7;border-bottom:1px solid #e6e6e6">
+              Outright (left) — vs Germany (right)
+            </td>
+          </tr>
+          {row1}
+
+          <tr><td colspan="2" style="height:14px"></td></tr>
+          <tr>
+            <td colspan="2" style="font:700 16px Arial;padding:6px 10px;background:#f7f7f7;border-bottom:1px solid #e6e6e6">
+              Outright Curve (left) — Box vs Germany (right)
+            </td>
+          </tr>
+          {row2}
+
+          <tr><td colspan="2" style="height:14px"></td></tr>
+          <tr>
+            <td colspan="2" style="font:700 16px Arial;padding:6px 10px;background:#f7f7f7;border-bottom:1px solid #e6e6e6">
+              Fly Outright (left) — Fly vs Germany (right)
+            </td>
+          </tr>
+          {row3}
+        </table>
+        </center>
+        <div style="height:12px"></div>
+        <div style="font:11px Arial;color:#666;padding:0 10px">Generated automatically.</div>
+      </body>
+    </html>
+    """
+
+    alt.attach(MIMEText("Carry Summaries (HTML view required).", 'plain'))
+    alt.attach(MIMEText(html_body, 'html'))
+
+    # Envoi (pas de login, pas de pièces jointes — inline uniquement)
+    smtp = smtplib.SMTP('mailhost.jpmchase.net')
+    smtp.sendmail(sender, to_list, root.as_string())
+    smtp.quit()
+
+# =============================
+# 5) EXEMPLE D'APPEL — À DÉCOMMENTER ET ADAPTER
+# =============================
+# Assure-toi d'avoir en mémoire :
+#   - best_outright, best_spread, best_curve, best_box, best_fly_out, best_fly_box
+#   - pivot_df_out, pivot_df_spread, pivot_df_curve, pivot_df_box, pivot_df_fly_out, pivot_df_fly_box
+#
+# send_carry_email_using_your_vars(
+#     to_list=["team@jpmorgan.com"],
+#     best_outright=best_outright,
+#     best_spread=best_spread,
+#     best_curve=best_curve,
+#     best_box=best_box,
+#     best_fly_out=best_fly_out,
+#     best_fly_box=best_fly_box,
+#     pivot_df_out=pivot_df_out,
+#     pivot_df_spread=pivot_df_spread,
+#     pivot_df_curve=pivot_df_curve,
+#     pivot_df_box=pivot_df_box,
+#     pivot_df_fly_out=pivot_df_fly_out,
+#     pivot_df_fly_box=pivot_df_fly_box,
+#     sender="your.email@jpmorgan.com",
+#     subject="Carry Summaries",
+#     countries=("France","Italy","Spain")
+# )
 
