@@ -24,7 +24,7 @@ color_map = {
     "Ireland":"#8c564b","Slovakia":"#7f7f7f","Slovenia":"#17b7cf"
 }
 
-# ---------- placement de texte : version intelligente ----------
+# ---------- placement de texte : version intelligente (8 directions) ----------
 def _candidate_positions(pad=6):
     # (dx, dy, ha, va) en "offset points"
     return [
@@ -42,10 +42,9 @@ def _best_text_position(ax, x, y, text, taken_bboxes, all_pts_xy,
                         pad=6, r_near=0.14, w_overlap=12.0, w_density=1.5, w_out=5.0):
     """
     Choisit la meilleure position pour le label autour du point (x,y).
-
     - taken_bboxes : bboxes déjà utilisées par d'autres labels
     - all_pts_xy   : np.array shape (N,2) avec toutes les coordonnées (Vol, CarryVal)
-    - r_near       : rayon (normalisé 0..1) pour mesurer la densité locale dans la direction
+    - r_near       : rayon (normalisé 0..1) pour mesurer la densité locale
     - pondérations : overlap >> out-of-axes >> densité
     """
     fig = ax.figure
@@ -60,7 +59,7 @@ def _best_text_position(ax, x, y, text, taken_bboxes, all_pts_xy,
     y_n = (y - y0) / yr
     R2 = (r_near ** 2)
 
-    best = None
+    best_bb = None
     best_score = float('inf')
     best_ann = None
 
@@ -101,21 +100,20 @@ def _best_text_position(ax, x, y, text, taken_bboxes, all_pts_xy,
             if best_ann is not None:
                 best_ann.remove()
             best_score = score
-            best = bb
+            best_bb = bb
             best_ann = ann
         else:
             ann.remove()
 
-    taken_bboxes.append(best)
-    # best_ann déjà dessiné
+    taken_bboxes.append(best_bb)
+    # best_ann est déjà tracé
 
 # ---------- extraction générique de points ----------
 def _df_to_scatter_points(df, key_col, dataset_name):
     """
     Prépare (x=Vol, y=CarryVal) + label par point.
     Exclusions:
-      - Greece toujours
-      - Germany exclu pour outright/curve_outright/fly_outright
+      - Greece & Germany toujours exclues des scatterplots (benchmark + data off)
     key_col ∈ {'Maturity','Box','Fly'}
     """
     carry_col = 'Carry' if 'Carry' in df.columns else 'CarrySpread'
@@ -126,10 +124,8 @@ def _df_to_scatter_points(df, key_col, dataset_name):
     d = d.dropna(subset=['Country','Key','Vol','CarryVal'])
     d = d[np.isfinite(d['Vol']) & np.isfinite(d['CarryVal'])]
 
-    # exclusions
-    d = d[~d['Country'].isin(['Greece'])]  # toujours exclue
-    if dataset_name in ('outright','curve_outright','fly_outright'):
-        d = d[~d['Country'].isin(['Germany'])]  # exclue sur outright-only
+    # exclusions globales
+    d = d[~d['Country'].isin(['Germany','Greece'])]
 
     # sécurité
     d = d[(d['Vol'] > 0) & (d['Vol'].abs() < 1e5) & (d['CarryVal'].abs() <= 15)]
@@ -138,13 +134,18 @@ def _df_to_scatter_points(df, key_col, dataset_name):
     def _label(row):
         c = country_shortcuts.get(row['Country'], row['Country'][:2].upper())
         k = row['Key']
-        if isinstance(k, (int, float)) and float(k).is_integer():
-            return f"{c} {int(k)}y"
+        try:
+            kk = float(k)
+            if kk.is_integer():
+                return f"{c} {int(kk)}y"
+        except Exception:
+            pass
         return f"{c} {k}"
     d['Label'] = d.apply(_label, axis=1)
     d['Color'] = d['Country'].map(color_map).fillna('black')
     d['CoV'] = d['CarryVal'] / d['Vol'].replace(0, np.nan)
-    return d.dropna(subset=['CoV'])
+    d = d.dropna(subset=['CoV'])
+    return d
 
 # ---------- aides de sélection ----------
 def _pick_top_for_country(df_pts, country, max_n=6, require_positive=True, prefer_maturities=(2,5,10,20)):
@@ -166,12 +167,14 @@ def _pick_top_for_country(df_pts, country, max_n=6, require_positive=True, prefe
         if not pos.empty:
             sub = pos
 
-    # tri par |CoV| décroissant puis par rank
-    sub = sub.sort_values(by=['_rank','CoV'], key=lambda s: (s if s.name=='_rank' else s.abs()),
-                          ascending=[True, False])
-    return sub.head(max_n).drop(columns=['_rank'])
+    # tri: par _rank asc puis |CoV| desc (sans key=…)
+    sub['abs_CoV'] = sub['CoV'].abs()
+    sub = sub.sort_values(by=['_rank','abs_CoV'], ascending=[True, False])
+    sub = sub.drop(columns=['abs_CoV'])
+    return sub.head(max_n)
 
-def _ensure_min_countries(selected, pool, min_countries=5, prefer_order=('Spain','Portugal','Belgium','Austria','Finland','Netherlands','Ireland','Slovakia','Slovenia')):
+def _ensure_min_countries(selected, pool, min_countries=5,
+                          prefer_order=('Spain','Portugal','Belgium','Austria','Finland','Netherlands','Ireland','Slovakia','Slovenia')):
     present = set(selected['Country'].unique())
     for c in prefer_order:
         if len(present) >= min_countries:
@@ -179,12 +182,14 @@ def _ensure_min_countries(selected, pool, min_countries=5, prefer_order=('Spain'
         cand = pool[(pool['Country'] == c) & (~pool.index.isin(selected.index))]
         if not cand.empty:
             # prends le meilleur point (|CoV|) de ce pays
-            pick = cand.iloc[[cand['CoV'].abs().idxmax()]]
+            cand = cand.copy()
+            cand['abs_CoV'] = cand['CoV'].abs()
+            pick = cand.loc[[cand['abs_CoV'].idxmax()]].drop(columns=['abs_CoV'])
             selected = pd.concat([selected, pick], axis=0)
             present.add(c)
     return selected
 
-def _grid_thinning(df_pts, must_keep_idx, grid=(14,9), max_per_cell=3, max_total=None, per_country_caps=None):
+def _grid_thinning(df_pts, must_keep_idx, grid=(16,10), max_per_cell=3, max_total=None, per_country_caps=None):
     """Thinning par grille (Vol x Carry) en gardant les 'must_keep' intouchés."""
     if df_pts.empty:
         return df_pts
@@ -203,16 +208,17 @@ def _grid_thinning(df_pts, must_keep_idx, grid=(14,9), max_per_cell=3, max_total
     df_pts['_cell'] = list(zip(gx, gy))
 
     kept = set(must_keep_idx)
-    # caps par pays
     caps = per_country_caps or {}
 
-    # commence par ajouter les non-must point par cellule, tri |CoV| desc
+    # ajoute par cellule (hors must), tri |CoV| desc
     for cell, g in df_pts[~df_pts.index.isin(kept)].groupby('_cell'):
-        g2 = g.sort_values(by='CoV', key=lambda s: s.abs(), ascending=False)
+        g2 = g.copy()
+        g2['abs_CoV'] = g2['CoV'].abs()
+        g2 = g2.sort_values(by='abs_CoV', ascending=False)
         count = 0
         for idx, row in g2.iterrows():
             c = row['Country']
-            # respect des caps par pays (hors must_keep)
+            # respect caps pays (hors must_keep)
             if caps:
                 already_c = sum(df_pts.loc[list(kept)]['Country'] == c)
                 if c in caps and already_c >= caps[c]:
@@ -226,12 +232,13 @@ def _grid_thinning(df_pts, must_keep_idx, grid=(14,9), max_per_cell=3, max_total
 
     # max_total global si demandé
     if max_total is not None and len(out) > max_total:
-        # garde tous les must_keep, puis complète par |CoV| desc
-        must = out.index.isin(must_keep_idx)
-        keep_idx = list(out[must].index)
-        rest = out[~must].sort_values(by='CoV', key=lambda s: s.abs(), ascending=False)
-        keep_idx += list(rest.index[:max(0, max_total - len(keep_idx))])
-        out = out.loc[keep_idx]
+        must_mask = out.index.isin(must_keep_idx)
+        must_part = out[must_mask]
+        rest = out[~must_mask].copy()
+        rest['abs_CoV'] = rest['CoV'].abs()
+        rest = rest.sort_values(by='abs_CoV', ascending=False).drop(columns=['abs_CoV'])
+        keep_rest = rest.head(max(0, max_total - len(must_part)))
+        out = pd.concat([must_part, keep_rest], axis=0)
 
     return out
 
@@ -250,13 +257,14 @@ def _select_points(points, dataset_name,
     if pts.empty:
         return pts
 
-    # 1) FR & IT forcés
+    # filtre initial carry>0 (sauf FR/IT qu’on forcera)
+    base = pts[pts['CarryVal'] > 0] if carry_positive else pts
+
+    # 1) FR & IT forcés (on relâche carry>0 si besoin)
     must_rows = []
     for c in ('France','Italy'):
-        # d'abord positifs
-        pick = _pick_top_for_country(pts, c, max_n=force_fr_it_min, require_positive=carry_positive)
+        pick = _pick_top_for_country(base, c, max_n=force_fr_it_min, require_positive=carry_positive)
         if len(pick) < force_fr_it_min:
-            # relâche pour compléter (inclut négatifs si besoin)
             extra = _pick_top_for_country(pts[~pts.index.isin(pick.index)], c,
                                           max_n=force_fr_it_min-len(pick), require_positive=False)
             pick = pd.concat([pick, extra], axis=0)
@@ -267,45 +275,38 @@ def _select_points(points, dataset_name,
     selected = must.copy()
     selected = _ensure_min_countries(selected, pts, min_countries=min_countries)
 
-    # ajoute quelques points "bons" en plus (hors must) avant thinning
+    # ajoute ES/PT si pas déjà pris
     pool = pts[~pts.index.isin(selected.index)].copy()
-    # priorise ES/PT
-    prefer = ['Spain','Portugal']
-    add = []
-    for c in prefer:
+    for c in ['Spain','Portugal']:
         sub = pool[pool['Country'] == c]
         if not sub.empty:
-            add.append(sub.loc[[sub['CoV'].abs().idxmax()]])
-    if add:
-        selected = pd.concat([selected] + add, axis=0).drop_duplicates()
+            sub = sub.copy()
+            sub['abs_CoV'] = sub['CoV'].abs()
+            pick = sub.loc[[sub['abs_CoV'].idxmax()]].drop(columns=['abs_CoV'])
+            selected = pd.concat([selected, pick], axis=0).drop_duplicates()
 
-    # 3) thinning par grille avec caps par pays
-    #    - caps plus stricts pour Finland & Netherlands
-    caps = {'Finland':3, 'Netherlands':3}
-    #    - caps génériques pour le reste (appliqués dans l’algo via already_c)
-    #      on peut aussi laisser non spécifié → seuls FI/NL sont bridés explicitement
-    must_idx = selected.index.tolist()  # FR/IT + diversité prioritaire
+    # union avant thinning
     union = pd.concat([selected, pool], axis=0).drop_duplicates()
 
-    thinned = _grid_thinning(union, must_keep_idx=must_idx,
+    # 3) thinning par grille avec caps par pays
+    caps = {'Finland':3, 'Netherlands':3}
+    thinned = _grid_thinning(union, must_keep_idx=selected.index.tolist(),
                              grid=(16,10), max_per_cell=3,
                              max_total=global_max_points, per_country_caps=caps)
 
-    # filtre final: si on veut éviter carry négatif en général, on le fait ici,
-    # mais en conservant les must_keep même s'ils sont négatifs
+    # filtre final carry>0 (garde toujours les must_keep, même si <=0)
     if carry_positive:
-        is_must = thinned.index.isin(must_idx)
-        thinned = pd.concat([
-            thinned[is_must],
-            thinned[~is_must & (thinned['CarryVal'] > 0)]
-        ], axis=0)
+        is_must = thinned.index.isin(selected.index)
+        thinned = pd.concat([thinned[is_must],
+                             thinned[~is_must & (thinned['CarryVal'] > 0)]], axis=0)
 
     # s’assure encore la diversité minimale
     thinned = _ensure_min_countries(thinned, pts, min_countries=min_countries)
 
     # ordre sympa: par pays puis |CoV|
-    thinned = thinned.sort_values(by=['Country','CoV'], key=lambda s: (s if s.name=='Country' else s.abs()),
-                                  ascending=[True, False])
+    thinned = thinned.copy()
+    thinned['abs_CoV'] = thinned['CoV'].abs()
+    thinned = thinned.sort_values(by=['Country','abs_CoV'], ascending=[True, False]).drop(columns=['abs_CoV'])
     return thinned
 
 # ---------- tracé générique ----------
@@ -318,7 +319,7 @@ def _plot_scatter_generic(df, key_col, dataset_name, title):
         dataset_name=dataset_name,
         force_fr_it_min=3,
         min_countries=5,
-        carry_positive=True if dataset_name not in ('box','fly_box') else True,  # on tentera de relâcher via FR/IT au besoin
+        carry_positive=True,      # on filtre négatifs, mais FR/IT peuvent être ajoutés si manque
         global_max_points=60
     )
 
@@ -326,7 +327,7 @@ def _plot_scatter_generic(df, key_col, dataset_name, title):
         print("Aucun point à tracer.")
         return
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.5))
+    fig, ax = plt.subplots(figsize=(10.8, 6.6))
     taken_bboxes = []
     pts_array = selected[['Vol','CarryVal']].to_numpy()
 
@@ -366,7 +367,7 @@ def plot_scatter_outright(df_outright):
                           title="Outright — Carry (y) vs Delivered Vol (x)")
 
 def plot_scatter_spread(df_spread):
-    # ton df_spread (Solution B) a une colonne 'Maturity' (pas 'Bucket') → OK
+    # ton df_spread (Solution B) a une colonne 'Maturity' (et 'CarrySpread' pour le Y)
     _plot_scatter_generic(df_spread, key_col='Maturity', dataset_name='spread',
                           title="Spreads vs Germany — Carry (y) vs Delivered Vol (x)")
 
