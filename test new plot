@@ -2,73 +2,71 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
-# --- petit helper pour éviter les surprises de types ---
-def _num(x):
-    try:
-        return float(x)
-    except Exception:
-        return np.nan
-
-# ---------- noyau : dessin d’un « candlestick » ----------
+# ---------- noyau : dessin d’un « candlestick » pour une sous-table ----------
 def _draw_candles(ax, rows, x_key, x_is_bucket=True, title="Candlestick", xlabel="Maturity Buckets"):
     """
-    rows: DataFrame avec colonnes:
-      Min, Max, Q25, Q50, Q75, Vol, CarryOverVol, CarryOneWeekAgo, et x_key (Bucket/Box/Fly).
-    x_key: 'Bucket' (numérique) ou 'Box'/'Fly' (catégoriel)
-    x_is_bucket: True si x est numérique; False si catégoriel.
+    rows: DataFrame filtré pour un pays (ou pair) avec colonnes:
+          Min, Max, Q25, Q50, Q75, Vol, CarryOverVol, CarryOneWeekAgo, et x_key (Bucket ou Box/Fly).
+    x_key: 'Bucket' ou 'Box'/'Fly'
+    x_is_bucket: True si x est numérique (buckets); False si catégoriel (Box/Fly)
     """
+    # -- Convertit proprement les colonnes en numérique (évite str/float errors)
+    cols_num = ["Min","Max","Q25","Q50","Q75","Vol","CarryOverVol","CarryOneWeekAgo"]
+    for c in cols_num:
+        if c in rows.columns:
+            rows[c] = pd.to_numeric(rows[c], errors="coerce")
+
     label_added = False
 
-    # map catégories -> positions numériques 1..N si besoin
+    # Si x est catégoriel (boxes/flies) -> on mappe en positions x = 1..N dans l'ordre d'apparition
     if not x_is_bucket:
         cats = rows[x_key].astype(str).tolist()
-        order = list(dict.fromkeys(cats))              # conserve l’ordre d’apparition
-        xpos  = {lab: i+1 for i, lab in enumerate(order)}
-        rows = rows.copy()
-        rows["_xpos_"] = rows[x_key].astype(str).map(xpos)
+        order = list(dict.fromkeys(cats))  # conserve l’ordre d’apparition
+        xpos = {lab: i+1 for i, lab in enumerate(order)}
         ax.set_xticks(list(xpos.values()))
         ax.set_xticklabels(order, rotation=0)
-        xcol = "_xpos_"
     else:
-        xcol = x_key
+        xpos = None
 
     for _, row in rows.iterrows():
-        vol = _num(row.get('Vol'))
-        if np.isnan(vol) or vol <= 0:
+        vol = row.get('Vol', np.nan)
+        if pd.isna(vol) or vol <= 0:
             continue
 
-        x = _num(row.get(xcol))
-        if np.isnan(x):
+        # X
+        x = row[x_key] if x_is_bucket else xpos[str(row[x_key])]
+
+        # Y (ratios)
+        min_val      = row['Min']  / vol if pd.notna(row['Min'])  else np.nan
+        max_val      = row['Max']  / vol if pd.notna(row['Max'])  else np.nan
+        q1_val       = row['Q25']  / vol if pd.notna(row['Q25'])  else np.nan
+        q3_val       = row['Q75']  / vol if pd.notna(row['Q75'])  else np.nan
+        median_val   = row['Q50']  / vol if pd.notna(row['Q50'])  else np.nan
+        current_val  = row['CarryOverVol']                     # déjà (carry/vol)
+        one_week_val = row['CarryOneWeekAgo'] / vol if pd.notna(row['CarryOneWeekAgo']) else np.nan
+
+        # Skip si valeurs clés manquantes
+        if any(pd.isna(v) for v in [min_val, max_val, q1_val, q3_val, median_val, current_val]):
             continue
 
-        # ratios (robuste aux types)
-        min_val      = _num(row.get('Min'))  / vol
-        max_val      = _num(row.get('Max'))  / vol
-        q1_val       = _num(row.get('Q25'))  / vol
-        q3_val       = _num(row.get('Q75'))  / vol
-        median_val   = _num(row.get('Q50'))  / vol
-        current_val  = _num(row.get('CarryOverVol'))              # déjà carry/vol
-        one_week_val = _num(row.get('CarryOneWeekAgo')) / vol if not pd.isna(row.get('CarryOneWeekAgo')) else np.nan
-
-        # tiges min↔max
+        # Tiges min↔max
         ax.plot([x, x], [min_val, max_val], color='black', marker='_', linewidth=2)
 
-        # bloc épais q25↔q75 (noir dessous, blanc dessus)
+        # Bloc épais q25↔q75 (noir dessous, blanc dessus)
         ax.plot([x, x], [q1_val, q3_val], color='black', linewidth=8, alpha=0.5)
         ax.plot([x, x], [q1_val, q3_val], color='white', linewidth=6, alpha=1.0)
 
-        # trait médian (noir)
-        ax.plot([x-0.12, x+0.12], [median_val, median_val], color='black', linewidth=2)
+        # Trait médian (noir)
+        ax.plot([x, x], [median_val, median_val], color='black', marker='_', markersize=6)
 
-        # CURRENT = trait rouge UNIQUEMENT (ta ligne exacte)
+        # Current = trait rouge UNIQUEMENT (ta ligne exacte)
         ax.plot(x, current_val, color='red', marker='_', markersize=10,
                 label='Current Value' if not label_added else "")
 
-        # ONE WEEK AGO = trait bleu + petit rond (ta ligne exacte + marqueur minuscule)
-        if not np.isnan(one_week_val):
+        # 1 week ago = trait bleu UNIQUEMENT (ta ligne exacte)
+        if pd.notna(one_week_val):
             ax.plot(x, one_week_val, color='steelblue', marker='_', markersize=8,
                     label='1 Week ago' if not label_added else "")
-            ax.plot(x, one_week_val, color='steelblue', marker='o', markersize=2)
 
         label_added = True
 
@@ -79,18 +77,22 @@ def _draw_candles(ax, rows, x_key, x_is_bucket=True, title="Candlestick", xlabel
     ax.grid(True)
     plt.tight_layout()
 
-# ---------- 1) SPREADS vs Germany (CountryPair + Maturity->Bucket) ----------
+
+# ---------- 1) SPREADS vs Germany (CountryPair) ----------
 def plot_candlestick_spreads(df_spread, countries=("France","Italy","Spain"), benchmark="Germany", min_bucket=2):
     """
-    df_spread colonnes nécessaires :
-      ['CountryPair','Maturity','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo']
+    df_spread doit contenir: ['CountryPair','Bucket' ou 'Maturity','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo'].
+    On filtre par CountryPair = f"{country}-{benchmark}".
     """
-    # IMPORTANT : renommer Maturity -> Bucket pour l’axe X numérique
-    df = df_spread.rename(columns={'Maturity': 'Bucket'}).copy()
+    # Harmonise 'Maturity' -> 'Bucket' si besoin
+    if 'Bucket' not in df_spread.columns and 'Maturity' in df_spread.columns:
+        df_spread = df_spread.rename(columns={'Maturity':'Bucket'})
 
     for c in countries:
         pair = f"{c}-{benchmark}"
-        sub = df[(df['CountryPair'] == pair) & (df['Bucket'] >= min_bucket)].copy()
+        sub = df_spread[(df_spread['CountryPair'] == pair)].copy()
+        if 'Bucket' in sub.columns:
+            sub = sub[pd.to_numeric(sub['Bucket'], errors='coerce').ge(min_bucket)]
         if sub.empty:
             print(f"[info] aucun point pour {pair}.")
             continue
@@ -99,13 +101,19 @@ def plot_candlestick_spreads(df_spread, countries=("France","Italy","Spain"), be
                       title=f"Candlestick-like Chart for {c}",
                       xlabel="Maturity Buckets")
 
-# ---------- 2) OUTRIGHT (Country + Maturity->Bucket) ----------
+
+# ---------- 2) OUTRIGHT (Country) ----------
 def plot_candlestick_outright(df_outright, countries=("France","Italy","Spain"), min_bucket=2):
     """
-    df_outright colonnes :
-      ['Country','Maturity','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo']
+    df_outright: colonnes ['Country','Maturity' (ou 'Bucket'), 'Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo'].
     """
-    df = df_outright.rename(columns={'Maturity':'Bucket'}).copy()
+    df = df_outright.copy()
+    if 'Bucket' not in df.columns and 'Maturity' in df.columns:
+        df = df.rename(columns={'Maturity':'Bucket'})
+
+    # bucket numérique pour filtrage
+    df['Bucket'] = pd.to_numeric(df['Bucket'], errors='coerce')
+
     for c in countries:
         sub = df[(df['Country'] == c) & (df['Bucket'] >= min_bucket)].copy()
         if sub.empty:
@@ -116,11 +124,11 @@ def plot_candlestick_outright(df_outright, countries=("France","Italy","Spain"),
                       title=f"Candlestick-like Chart for {c}",
                       xlabel="Maturity Buckets")
 
+
 # ---------- 3) CURVE OUTRIGHT (Country, x = Box catégoriel) ----------
 def plot_candlestick_curve_outright(df_curve, countries=("France","Italy","Spain")):
     """
-    df_curve colonnes :
-      ['Country','Box','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo']
+    df_curve: ['Country','Box','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo'].
     """
     for c in countries:
         sub = df_curve[df_curve['Country'] == c].copy()
@@ -132,11 +140,11 @@ def plot_candlestick_curve_outright(df_curve, countries=("France","Italy","Spain
                       title=f"Candlestick-like Chart for {c}",
                       xlabel="Boxes")
 
+
 # ---------- 4) BOX SPREADS vs Germany (Country, x = Box catégoriel) ----------
 def plot_candlestick_box_spreads(df_box, countries=("France","Italy","Spain")):
     """
-    df_box colonnes :
-      ['Country','Box','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo']
+    df_box: ['Country','Box','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo'].
     """
     for c in countries:
         sub = df_box[df_box['Country'] == c].copy()
@@ -148,11 +156,11 @@ def plot_candlestick_box_spreads(df_box, countries=("France","Italy","Spain")):
                       title=f"Candlestick-like Chart for {c}",
                       xlabel="Boxes")
 
+
 # ---------- 5) FLY OUTRIGHT (Country, x = Fly catégoriel) ----------
 def plot_candlestick_fly_outright(df_fly_out, countries=("France","Italy","Spain")):
     """
-    df_fly_out colonnes :
-      ['Country','Fly','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo']
+    df_fly_out: ['Country','Fly','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo'].
     """
     for c in countries:
         sub = df_fly_out[df_fly_out['Country'] == c].copy()
@@ -164,11 +172,11 @@ def plot_candlestick_fly_outright(df_fly_out, countries=("France","Italy","Spain
                       title=f"Candlestick-like Chart for {c}",
                       xlabel="Flies")
 
+
 # ---------- 6) FLY BOX SPREADS vs Germany (Country, x = Fly catégoriel) ----------
 def plot_candlestick_fly_box_spreads(df_fly_box, countries=("France","Italy","Spain")):
     """
-    df_fly_box colonnes :
-      ['Country','Fly','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo']
+    df_fly_box: ['Country','Fly','Min','Max','Q25','Q50','Q75','Vol','CarryOverVol','CarryOneWeekAgo'].
     """
     for c in countries:
         sub = df_fly_box[df_fly_box['Country'] == c].copy()
@@ -179,4 +187,3 @@ def plot_candlestick_fly_box_spreads(df_fly_box, countries=("France","Italy","Sp
         _draw_candles(ax, sub, x_key='Fly', x_is_bucket=False,
                       title=f"Candlestick-like Chart for {c}",
                       xlabel="Flies")
-
