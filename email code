@@ -1,1 +1,293 @@
+# =========================
+# SCATTER — Carry (y) vs Delivered Vol (x)
+# =========================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
+# --- abréviations & couleurs ---
+country_shortcuts = {
+    "France":"FR","Italy":"IT","Spain":"ES","Portugal":"PT","Belgium":"BE",
+    "Austria":"AT","Finland":"FI","Netherlands":"NL","Ireland":"IE","Slovakia":"SK","Slovenia":"SI",
+    "Germany":"DE","Greece":"GR"
+}
+color_map = {
+    "France":"#1f77b4","Italy":"#17becf","Spain":"#ff7f0e","Portugal":"#bcbd22",
+    "Belgium":"#9467bd","Austria":"#d62728","Finland":"#2ca02c","Netherlands":"#e377c2",
+    "Ireland":"#8c564b","Slovakia":"#7f7f7f","Slovenia":"#17b7cf"
+}
+
+# ---------- placement de texte (8 directions, score overlap+density+bord) ----------
+def _candidate_positions(pad=6):
+    return [
+        (0,+pad,'center','bottom'), (0,-pad,'center','top'),
+        (+pad,0,'left','center'),   (-pad,0,'right','center'),
+        (+pad,+pad,'left','bottom'),(-pad,+pad,'right','bottom'),
+        (+pad,-pad,'left','top'),   (-pad,-pad,'right','top')
+    ]
+
+def _best_text_position(ax, x, y, text, taken_bboxes, all_xy,
+                        pad=6, r_near=0.14, w_overlap=12.0, w_density=1.5, w_out=5.0):
+    fig = ax.figure
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    xv, yv = all_xy[:,0], all_xy[:,1]
+    x0, x1 = float(np.nanmin(xv)), float(np.nanmax(xv))
+    y0, y1 = float(np.nanmin(yv)), float(np.nanmax(yv))
+    xr, yr = max(x1-x0,1e-9), max(y1-y0,1e-9)
+    x_n, y_n = (x-x0)/xr, (y-y0)/yr
+    R2 = r_near**2
+
+    best_score, best_bb, best_ann = float('inf'), None, None
+    for dx,dy,ha,va in _candidate_positions(pad):
+        ann = ax.annotate(text, (x,y), textcoords="offset points", xytext=(dx,dy),
+                          ha=ha, va=va, fontsize=9)
+        bb = ann.get_window_extent(renderer=r).expanded(1.03, 1.15)
+
+        # chevauchement
+        overlap_pen = sum(bb.overlaps(tb) for tb in taken_bboxes)
+
+        # densité dans la direction du label
+        m = np.ones_like(xv, dtype=bool)
+        if dx!=0: m &= (np.sign(xv-x)==np.sign(dx)) | np.isclose(xv,x)
+        if dy!=0: m &= (np.sign(yv-y)==np.sign(dy)) | np.isclose(yv,y)
+        xn = (xv[m]-x0)/xr; yn = (yv[m]-y0)/yr
+        density_pen = float(np.sum((xn-x_n)**2 + (yn-y_n)**2 <= R2))
+
+        # hors cadre
+        xl, yl = ax.get_xlim(), ax.get_ylim()
+        out_pen = 1.0 if (x<xl[0] or x>xl[1] or y<yl[0] or y>yl[1]) else 0.0
+
+        score = w_overlap*overlap_pen + w_density*density_pen + w_out*out_pen
+        if score < best_score:
+            if best_ann is not None: best_ann.remove()
+            best_score, best_bb, best_ann = score, bb, ann
+        else:
+            ann.remove()
+
+    taken_bboxes.append(best_bb)
+
+# ---------- préparation des points ----------
+def _df_to_scatter_points(df, key_col, dataset_name):
+    # carry: 'Carry' (ou 'CarrySpread' pour spreads/boxes/flies)
+    carry_col = 'Carry' if 'Carry' in df.columns else 'CarrySpread'
+    cols = [c for c in ['Country', key_col, 'Vol', carry_col] if c in df.columns]
+    d = df[cols].copy().rename(columns={key_col:'Key', carry_col:'CarryVal'})
+    d = d.dropna(subset=['Country','Key','Vol','CarryVal'])
+    d = d[np.isfinite(d['Vol']) & np.isfinite(d['CarryVal'])]
+
+    # exclusions pays
+    d = d[~d['Country'].isin(['Greece'])]                         # toujours exclue
+    if dataset_name in ('outright','curve_outright','fly_outright'):
+        d = d[~d['Country'].isin(['Germany'])]                   # pas de benchmark sur outright
+
+    # bornes de sécurité
+    d = d[(d['Vol'] > 0) & (d['Vol'].abs() < 1e5) & (d['CarryVal'].abs() <= 40)]
+
+    # labels & couleurs
+    def _lab(row):
+        c = country_shortcuts.get(row['Country'], row['Country'][:2].upper())
+        k = row['Key']
+        try:
+            if float(k).is_integer(): return f"{c} {int(float(k))}y"
+        except Exception:
+            pass
+        return f"{c} {k}"
+    d['Label'] = d.apply(_lab, axis=1)
+    d['Color'] = d['Country'].map(color_map).fillna('black')
+
+    # ratio pour priorité
+    d['CoV'] = d['CarryVal'] / d['Vol'].replace(0, np.nan)
+    d = d.dropna(subset=['CoV'])
+
+    return d
+
+# ---------- aides de sélection ----------
+def _pick_top_for_country(df_pts, country, max_n=3, require_positive=True, prefer=(2,5,10,20)):
+    sub = df_pts[df_pts['Country']==country].copy()
+    if sub.empty: return sub
+
+    # priorité maturités
+    sub['rankA'] = 2  # non-numériques par défaut
+    sub['rankB'] = 0.0
+    def _rank_key(k):
+        try:
+            kk = float(k)
+            return (0 if int(kk) in prefer else 1, abs(kk-10))
+        except Exception:
+            return (2, 0.0)
+    rk = sub['Key'].apply(_rank_key)
+    sub['rankA'] = [a for a,_ in rk]
+    sub['rankB'] = [b for _,b in rk]
+
+    if require_positive:
+        pos = sub[sub['CarryVal'] > 0]
+        if not pos.empty: sub = pos
+
+    sub['absCoV'] = sub['CoV'].abs()
+    sub = sub.sort_values(['rankA','rankB','absCoV'], ascending=[True, True, False])
+    return sub.head(max_n).drop(columns=['rankA','rankB','absCoV'])
+
+def _ensure_min_countries(selected, pool, min_countries=5,
+                          prefer_order=('Spain','Portugal','Belgium','Austria','Finland','Netherlands','Ireland','Slovakia','Slovenia')):
+    present = set(selected['Country'].unique())
+    for c in prefer_order:
+        if len(present) >= min_countries: break
+        cand = pool[(pool['Country']==c) & (~pool.index.isin(selected.index)) & (pool['CarryVal']>0)]
+        if not cand.empty:
+            cand = cand.assign(absCoV=cand['CoV'].abs()).sort_values('absCoV', ascending=False).drop(columns='absCoV')
+            pick = cand.iloc[[0]]
+            selected = pd.concat([selected, pick], axis=0)
+            present.add(c)
+    return selected
+
+def _grid_thinning(df_pts, must_keep_idx, grid=(16,10), max_per_cell=2, max_total=None, per_country_caps=None):
+    if df_pts.empty: return df_pts
+
+    x = df_pts['Vol'].values; y = df_pts['CarryVal'].values
+    x0,x1 = np.nanmin(x), np.nanmax(x); y0,y1 = np.nanmin(y), np.nanmax(y)
+    xr, yr = max(x1-x0,1e-6), max(y1-y0,1e-6)
+    gx = np.clip(((x-x0)/xr*(grid[0]-1)).astype(int), 0, grid[0]-1)
+    gy = np.clip(((y-y0)/yr*(grid[1]-1)).astype(int), 0, grid[1]-1)
+    df = df_pts.copy(); df['_cell'] = list(zip(gx,gy))
+    kept = set(must_keep_idx)
+    caps = per_country_caps or {}
+
+    # tri local par |CoV| décroissant
+    df['absCoV'] = df['CoV'].abs()
+    for cell, g in df[~df.index.isin(kept)].groupby('_cell'):
+        g2 = g.sort_values('absCoV', ascending=False)
+        taken = 0
+        for idx,row in g2.iterrows():
+            c = row['Country']
+            if c in caps:
+                already = sum(df.loc[list(kept)]['Country']==c)
+                if already >= caps[c]: continue
+            kept.add(idx)
+            taken += 1
+            if taken >= max_per_cell: break
+
+    out = df.loc[sorted(kept)].drop(columns=['_cell','absCoV'])
+
+    if (max_total is not None) and (len(out) > max_total):
+        must = out.index.isin(must_keep_idx)
+        rest = out[~must].copy()
+        rest['absCoV'] = rest['CoV'].abs()
+        rest = rest.sort_values('absCoV', ascending=False).drop(columns='absCoV')
+        keep = list(out[must].index) + list(rest.index[:max_total - sum(must)])
+        out = out.loc[keep]
+    return out
+
+# ---------- sélection principale (très stricte & no negative carry) ----------
+def _select_points(points, dataset_name,
+                   force_fr_it_min=3,     # FR & IT ≥ 3 points chacun
+                   min_countries=5,       # ≥ 5 pays au total
+                   global_max_points=28,  # plafond global pour lisibilité
+                   caps_extra=None):
+    pts = points.copy()
+    # *** zéro tolérance carry négatif ***
+    pts = pts[pts['CarryVal'] > 0]
+
+    # 1) FR & IT forcés
+    must_rows = []
+    for c in ('France','Italy'):
+        pick = _pick_top_for_country(pts, c, max_n=force_fr_it_min, require_positive=True)
+        must_rows.append(pick)
+    must = pd.concat(must_rows, axis=0) if must_rows else pd.DataFrame(columns=pts.columns)
+
+    # 2) diversité (≥5 pays), avec priorité ES/PT/BE/AT/FI/NL...
+    selected = _ensure_min_countries(must.copy(), pts, min_countries=min_countries)
+
+    # 3) thinning agressif (max 2 points par cellule), caps par pays
+    caps = {'Finland':3, 'Netherlands':3}
+    if caps_extra: caps.update(caps_extra)
+
+    pool = pts[~pts.index.isin(selected.index)]
+    union = pd.concat([selected, pool], axis=0).drop_duplicates()
+    thinned = _grid_thinning(union, must_keep_idx=selected.index.tolist(),
+                             grid=(18,11), max_per_cell=2,
+                             max_total=global_max_points, per_country_caps=caps)
+
+    # revérifie diversité
+    thinned = _ensure_min_countries(thinned, pts, min_countries=min_countries)
+
+    # ordre final propre (par pays puis |CoV|)
+    thinned['absCoV'] = thinned['CoV'].abs()
+    thinned = thinned.sort_values(['Country','absCoV'], ascending=[True, False]).drop(columns='absCoV')
+    return thinned
+
+# ---------- tracé générique ----------
+def _plot_scatter_generic(df, key_col, dataset_name, title,
+                          max_points_out=28):
+    pts = _df_to_scatter_points(df, key_col, dataset_name)
+    if pts.empty:
+        print("Aucune donnée.")
+        return
+
+    # plafond plus bas pour Box/Fly (souvent plus tassés)
+    cap = max_points_out if dataset_name in ('outright','spread') else max(20, max_points_out-6)
+
+    selected = _select_points(
+        pts, dataset_name=dataset_name,
+        force_fr_it_min=3, min_countries=5,
+        global_max_points=cap,
+        caps_extra=None
+    )
+    if selected.empty:
+        print("Rien à tracer (après filtrage).")
+        return
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.5))
+    ax.axhline(0, color='grey', linewidth=0.8)
+    ax.axvline(0, color='grey', linewidth=0.8)
+
+    taken_bboxes = []
+    xy = selected[['Vol','CarryVal']].to_numpy()
+
+    for _, row in selected.iterrows():
+        ax.plot(row['Vol'], row['CarryVal'], marker='D', markersize=8,
+                linestyle='None', color=row['Color'])
+        _best_text_position(ax, row['Vol'], row['CarryVal'], row['Label'],
+                            taken_bboxes=taken_bboxes, all_xy=xy,
+                            pad=6, r_near=0.14, w_overlap=12.0, w_density=1.5, w_out=5.0)
+
+    # légende pays présents
+    countries = selected['Country'].unique().tolist()
+    legend_elems = [Line2D([0],[0], marker='D', color='w',
+                           markerfacecolor=color_map.get(c,'black'), markersize=8,
+                           label=country_shortcuts.get(c,c))
+                    for c in countries]
+    ax.legend(handles=legend_elems, title="Country", loc='upper right', fontsize=9)
+
+    ax.set_xlabel("Delivered vol (bp)")
+    ax.set_ylabel("Carry (bp)")
+    ax.set_title(title, pad=14)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.show()
+
+# ---------- wrappers (1 par dataset) ----------
+def plot_scatter_outright(df_outright):
+    _plot_scatter_generic(df_outright, key_col='Maturity', dataset_name='outright',
+                          title="Outright — Carry (y) vs Delivered Vol (x)")
+
+def plot_scatter_spread(df_spread):
+    _plot_scatter_generic(df_spread, key_col='Maturity', dataset_name='spread',
+                          title="Spreads vs Germany — Carry (y) vs Delivered Vol (x)")
+
+def plot_scatter_curve_outright(df_curve):
+    _plot_scatter_generic(df_curve, key_col='Box', dataset_name='curve_outright',
+                          title="Curve Outright — Carry (y) vs Delivered Vol (x)")
+
+def plot_scatter_box(df_box):
+    _plot_scatter_generic(df_box, key_col='Box', dataset_name='box',
+                          title="Box vs Germany — Carry (y) vs Delivered Vol (x)")
+
+def plot_scatter_fly_outright(df_fly_out):
+    _plot_scatter_generic(df_fly_out, key_col='Fly', dataset_name='fly_outright',
+                          title="Fly Outright — Carry (y) vs Delivered Vol (x)")
+
+def plot_scatter_fly_box(df_fly_box):
+    _plot_scatter_generic(df_fly_box, key_col='Fly', dataset_name='fly_box',
+                          title="Fly vs Germany — Carry (y) vs Delivered Vol (x)")
