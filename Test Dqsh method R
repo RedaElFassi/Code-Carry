@@ -1,0 +1,589 @@
+# =========================
+# FULL PIPELINE — Synth Representatives + VOL fallback via `data`
+# =========================
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ---------- PARAMS & INPUTS ----------
+country_list       = ["France","Italy","Spain","Portugal","Belgium","Austria","Finland","Greece"]
+benchmark_country  = "Germany"
+today              = pd.Timestamp.today().normalize()
+
+# Fenêtres / seuils (jours ouvrés ~)
+VOL_WINDOW   = 63      # ~3 mois pour la vol
+HIST_WINDOW  = 126     # ~6 mois pour quantiles de carry
+MIN_Y_POINTS = 40      # minimum “raisonnable” pour estimer une vol
+HARD_CARRY_CAP = 15.0  # mêmes cap que ton code
+
+# ---------- Buckets & Combos ----------
+Maturity_Buckets = {
+    1:(0.5,1.5), 2:(1.8,2.5), 3:(2.5,3.5), 4:(3.5,4.5), 5:(4.5,5.5),
+    7:(6.5,7.5), 10:(9,11), 15:(13,17), 20:(18,22), 25:(23,27), 30:(27,33),
+}
+maturity_order = [1,2,3,4,5,7,10,15,20,25,30]
+
+box_order  = ['2s10s','5s10s','2s30s','5s30s','10s30s','10s15s']
+maturity_combinations = [(2,10),(5,10),(2,30),(5,30),(10,30),(10,15)]
+
+fly_order  = ['2s5s10s','5s7s10s','10s15s30s','5s10s30s']
+fly_combinations = [(2,5,10),(5,7,10),(10,15,30),(5,10,30)]
+
+# ---------- Helpers génériques ----------
+def years_to_maturity(bond_name: str):
+    try:
+        parts = bond_name.split()
+        d = datetime.strptime(parts[3], "%d-%b-%Y")
+        return (d - today).days / 365.25
+    except Exception:
+        return None
+
+def get_maturity_bucket(bond_name: str):
+    y = years_to_maturity(bond_name)
+    if y is None: return None
+    for b,(lo,hi) in Maturity_Buckets.items():
+        if lo <= y <= hi: return b
+    return None
+
+def recent_enough(idx: pd.Index, max_age_days=7) -> bool:
+    if len(idx)==0: return False
+    return (today - pd.Timestamp(idx[-1])).days <= max_age_days
+
+def rowwise_mean(series_list):
+    if not series_list: return pd.Series(dtype=float)
+    df = pd.concat(series_list, axis=1)
+    return df.mean(axis=1, skipna=True)
+
+def tukey_filter_on_spot(carries, whisker=1.5):
+    arr = np.asarray(carries, dtype=float)
+    if len(arr) <= 2:
+        return np.ones_like(arr, dtype=bool)
+    q1, q3 = np.nanpercentile(arr, [25, 75])
+    iqr = q3 - q1
+    lo, hi = q1 - whisker*iqr, q3 + whisker*iqr
+    return (arr >= lo) & (arr <= hi)
+
+def fly_weights(s, m, l):
+    return {s:-1.0, m:2.0, l:-1.0}
+
+# ---------- Helpers “inputs filtrés” ----------
+def filter_yield_bonds(df: pd.DataFrame, min_days: int = VOL_WINDOW):
+    keep = []
+    for c in df.columns:
+        s = df[c]
+        if len(s.dropna()) >= min_days and s.iloc[-min_days:].isna().sum()==0 and recent_enough(s.dropna().index):
+            keep.append(c)
+    return df[keep], keep
+
+def filter_carry_bonds(df: pd.DataFrame):
+    keep = []
+    for c in df.columns:
+        s = df[c]
+        if pd.isna(s.iloc[-1]): continue
+        if abs(s.iloc[-1]) > HARD_CARRY_CAP: continue
+        if not recent_enough(s.dropna().index): continue
+        keep.append(c)
+    return df[keep], keep
+
+def prepare_filtered_inputs(bond_lists, carry_dfs, yield_dfs):
+    filtered_bond_lists, filtered_carry_dfs, filtered_yield_dfs = {}, {}, {}
+    for c in set(list(bond_lists.keys()) + [benchmark_country]):
+        if c not in bond_lists: 
+            continue
+        df_carry, carry_cols = filter_carry_bonds(carry_dfs[c])
+        df_yield, yld_cols   = filter_yield_bonds(yield_dfs[c])
+        common = sorted(set(carry_cols) & set(yld_cols))
+        filtered_carry_dfs[c]   = df_carry[common]
+        filtered_yield_dfs[c]   = df_yield[common]
+        filtered_bond_lists[c]  = [b for b in bond_lists[c] if b in common]
+    return filtered_bond_lists, filtered_carry_dfs, filtered_yield_dfs
+
+# ---------- NEW: helpers pour le fallback `data` ----------
+def data_col_name(country: str, bucket: int) -> str:
+    """Ex: ('France', 2) -> 'France 2Y' """
+    return f"{country} {int(bucket)}Y"
+
+def get_data_yield_series(data: pd.DataFrame, country: str, bucket: int) -> pd.Series:
+    col = data_col_name(country, bucket)
+    if col in data.columns:
+        s = pd.to_numeric(data[col], errors="coerce").dropna()
+        return s
+    return pd.Series(dtype=float)
+
+def ok_for_vol(s: pd.Series, window=VOL_WINDOW, min_points=MIN_Y_POINTS) -> bool:
+    if s is None or s.empty: return False
+    if not recent_enough(s.index): return False
+    tail = s[-min(len(s), window):].dropna()
+    return len(tail) >= min_points
+
+def choose_vol_series(primary: pd.Series, fallback: pd.Series):
+    """Retourne la série à utiliser (priorité au primaire si OK)."""
+    if ok_for_vol(primary):  return primary
+    if ok_for_vol(fallback): return fallback
+    return None  # pas de vol possible
+
+def vol_3m_bp(series: pd.Series, window=VOL_WINDOW):
+    """std des rendements/levels (déjà des yields), en bp sur la fenêtre."""
+    tail = series[-min(len(series), window):]
+    return (tail * 100.0).std()
+
+# ---------- Représentants synthétiques ----------
+def build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs):
+    filtered_bond_lists, filtered_carry_dfs, filtered_yield_dfs = prepare_filtered_inputs(
+        bond_lists, carry_dfs, yield_dfs
+    )
+    synth_carry, synth_yield, synth_meta = {}, {}, {}
+
+    countries_all = list(set(country_list + [benchmark_country]))
+    for country in countries_all:
+        if country not in filtered_bond_lists: 
+            continue
+        c_bonds = filtered_bond_lists[country]
+        c_carry = filtered_carry_dfs[country]
+        c_yld   = filtered_yield_dfs[country]
+
+        by_bucket = {}
+        for b in c_bonds:
+            buck = get_maturity_bucket(b)
+            if buck is None: 
+                continue
+            by_bucket.setdefault(buck, []).append(b)
+
+        for buck, bonds in by_bucket.items():
+            spots, bonds_ok = [], []
+            for b in bonds:
+                s = c_carry[b]
+                if pd.isna(s.iloc[-1]): continue
+                if abs(s.iloc[-1]) > HARD_CARRY_CAP: continue
+                if not recent_enough(s.dropna().index): continue
+                spots.append(float(s.iloc[-1])); bonds_ok.append(b)
+            if not bonds_ok: continue
+
+            spots = np.array(spots, dtype=float)
+            pos_mask = spots > 0
+            if pos_mask.any():
+                candidates = [b for b, keep in zip(bonds_ok, pos_mask) if keep]
+                cand_spots = spots[pos_mask]
+            else:
+                candidates = bonds_ok; cand_spots = spots
+
+            keep_mask = tukey_filter_on_spot(cand_spots, whisker=1.5)
+            filtered_candidates = [b for b, keep in zip(candidates, keep_mask) if keep]
+            if not filtered_candidates:
+                best_idx = int(np.argmax(cand_spots))
+                filtered_candidates = [candidates[best_idx]]
+
+            carry_series_list = [filtered_carry_dfs[country][b].dropna() for b in filtered_candidates]
+            yld_series_list   = [filtered_yield_dfs[country][b].dropna()   for b in filtered_candidates]
+            carry_synth = rowwise_mean(carry_series_list).dropna()
+            yld_synth   = rowwise_mean(yld_series_list).dropna()
+
+            if len(carry_synth) and abs(carry_synth.iloc[-1]) > HARD_CARRY_CAP:
+                continue
+
+            synth_carry.setdefault(country, {})[buck] = carry_synth
+            synth_yield.setdefault(country, {})[buck] = yld_synth
+            synth_meta.setdefault(country, {})[buck]  = {
+                "members": filtered_candidates,
+                "spot": float(carry_synth.iloc[-1]) if len(carry_synth) else np.nan,
+                "spot_count": len(filtered_candidates),
+                "had_positive": bool(pos_mask.any())
+            }
+
+    return synth_carry, synth_yield, synth_meta
+
+# ---------- 1) OUTRIGHT ----------
+def compute_outright(bond_lists, carry_dfs, yield_dfs, data: pd.DataFrame):
+    synth_carry, synth_yield, _ = build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs)
+    rows = []
+    for country in country_list + [benchmark_country]:
+        if country not in synth_carry: 
+            continue
+        for m in sorted(synth_carry[country].keys()):
+            cS = synth_carry[country][m]
+            yS = synth_yield[country][m]
+            if cS.empty: continue
+            carry_spot = cS.iloc[-1]
+            if pd.isna(carry_spot) or abs(carry_spot) > HARD_CARRY_CAP: 
+                continue
+            if not recent_enough(cS.index): continue
+
+            # vol outright: primaire = yS ; fallback = data['Country mY']
+            y_fallback = get_data_yield_series(data, country, m)
+            y_src = choose_vol_series(yS, y_fallback)
+            if y_src is None: 
+                continue
+            vol = vol_3m_bp(y_src)
+
+            # quantiles carry (min 6m ou moins si indispo)
+            h = min(HIST_WINDOW, len(cS))
+            if h < 10:  # trop court -> skip
+                continue
+            q = cS[-h:].quantile([0,.25,.5,.75,1])
+            wk = cS.iloc[-8] if len(cS) >= 8 else np.nan
+
+            rows.append({
+                "Country": country, "Maturity": m,
+                "Carry": float(carry_spot), "Vol": float(vol), "CarryOverVol": float(carry_spot/vol) if vol else np.nan,
+                "Min": q.iloc[0], "Q25": q.iloc[1], "Q50": q.iloc[2], "Q75": q.iloc[3], "Max": q.iloc[4],
+                "CarryOneWeekAgo": wk
+            })
+    return pd.DataFrame(rows)
+
+def pivot_outright(best_outright: pd.DataFrame):
+    p = best_outright.pivot(index='Country', columns='Maturity', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    existing = [m for m in maturity_order if m in p.columns.levels[0]]
+    p = p.reindex(columns=existing, level=0).sort_index(axis=1, level=0)
+    return p.round(1)
+
+# ---------- 2) SPREADS vs Germany ----------
+def compute_spreads_from_synth(bond_lists, carry_dfs, yield_dfs, data: pd.DataFrame):
+    synth_carry, synth_yield, _ = build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs)
+    rows = []
+    if benchmark_country not in synth_carry:
+        return pd.DataFrame()
+
+    for country in country_list:
+        if country not in synth_carry: 
+            continue
+        for m in sorted(set(synth_carry[country].keys()) & set(synth_carry[benchmark_country].keys())):
+            cC = synth_carry[country][m]; cD = synth_carry[benchmark_country][m]
+            yC = synth_yield[country][m];  yD = synth_yield[benchmark_country][m]
+            if cC.empty or cD.empty: continue
+
+            cs = float(cC.iloc[-1] - cD.iloc[-1])
+            if abs(cs) > HARD_CARRY_CAP: continue
+            if not (recent_enough(cC.index) and recent_enough(cD.index)): continue
+
+            # vol spread (primaire = diff(yC - yD); fallback = diff(data))
+            diff_primary = None
+            if not yC.empty and not yD.empty:
+                common_y = yC.index.intersection(yD.index)
+                diff_primary = (yC.reindex(common_y) - yD.reindex(common_y)).dropna()
+
+            yC_fb = get_data_yield_series(data, country, m)
+            yD_fb = get_data_yield_series(data, benchmark_country, m)
+            diff_fallback = None
+            if not yC_fb.empty and not yD_fb.empty:
+                common_fb = yC_fb.index.intersection(yD_fb.index)
+                diff_fallback = (yC_fb.reindex(common_fb) - yD_fb.reindex(common_fb)).dropna()
+
+            diff_src = choose_vol_series(diff_primary, diff_fallback)
+            if diff_src is None: 
+                continue
+            vol = vol_3m_bp(diff_src)
+
+            # quantiles (min 6m ou moins)
+            common_c = cC.index.intersection(cD.index)
+            cdiff = (cC.reindex(common_c) - cD.reindex(common_c)).dropna()
+            h = min(HIST_WINDOW, len(cdiff))
+            if h < 10: 
+                continue
+            q = cdiff[-h:].quantile([0,.25,.5,.75,1])
+            wk = cdiff.iloc[-8] if len(cdiff) >= 8 else np.nan
+
+            rows.append({
+                "CountryPair": f"{country}-{benchmark_country}",
+                "Country": country,
+                "Maturity": m,
+                "CarrySpread": cs, "Vol": float(vol), "CarryOverVol": float(cs/vol) if vol else np.nan,
+                "Min": q.iloc[0], "Q25": q.iloc[1], "Q50": q.iloc[2], "Q75": q.iloc[3], "Max": q.iloc[4],
+                "CarryOneWeekAgo": wk
+            })
+    return pd.DataFrame(rows)
+
+def pivot_spread(best_spread: pd.DataFrame):
+    p = best_spread.pivot(index='Country', columns='Maturity', values=['CarrySpread','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    existing = [m for m in maturity_order if m in p.columns.levels[0]]
+    p = p.reindex(columns=existing, level=0).sort_index(axis=1, level=0)
+    return p.round(1)
+
+# ---------- 3) CURVE OUTRIGHT ----------
+def compute_curve_outright_from_synth(bond_lists, carry_dfs, yield_dfs, data: pd.DataFrame):
+    synth_carry, synth_yield, _ = build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs)
+    rows = []
+    for country in country_list + [benchmark_country]:
+        if country not in synth_carry: 
+            continue
+        by_bucket_carry = synth_carry[country]
+        by_bucket_yield = synth_yield[country]
+        for s,l in maturity_combinations:
+            if s not in by_bucket_carry or l not in by_bucket_carry:
+                continue
+            cS, cL = by_bucket_carry[s], by_bucket_carry[l]
+            yS, yL = by_bucket_yield.get(s, pd.Series(dtype=float)), by_bucket_yield.get(l, pd.Series(dtype=float))
+            if cS.empty or cL.empty: continue
+
+            carry_box = float(cL.iloc[-1] - cS.iloc[-1])
+            if abs(carry_box) > HARD_CARRY_CAP: continue
+            if not (recent_enough(cS.index) and recent_enough(cL.index)): continue
+
+            # vol sur diff(yL - yS) – fallback via data
+            diff_primary = None
+            if not yS.empty and not yL.empty:
+                common = yS.index.intersection(yL.index)
+                diff_primary = (yL.reindex(common) - yS.reindex(common)).dropna()
+
+            yS_fb = get_data_yield_series(data, country, s)
+            yL_fb = get_data_yield_series(data, country, l)
+            diff_fallback = None
+            if not yS_fb.empty and not yL_fb.empty:
+                common_fb = yS_fb.index.intersection(yL_fb.index)
+                diff_fallback = (yL_fb.reindex(common_fb) - yS_fb.reindex(common_fb)).dropna()
+
+            diff_src = choose_vol_series(diff_primary, diff_fallback)
+            if diff_src is None: 
+                continue
+            vol = vol_3m_bp(diff_src)
+
+            # quantiles
+            cdiff = (cL - cS).dropna()
+            h = min(HIST_WINDOW, len(cdiff))
+            if h < 10: 
+                continue
+            q = cdiff[-h:].quantile([0,.25,.5,.75,1])
+            wk = cdiff.iloc[-8] if len(cdiff) >= 8 else np.nan
+
+            rows.append({
+                "Country": country,
+                "Box": f"{s}s{l}s",
+                "Carry": carry_box, "Vol": float(vol), "CarryOverVol": float(carry_box/vol) if vol else np.nan,
+                "Min": q.iloc[0], "Q25": q.iloc[1], "Q50": q.iloc[2], "Q75": q.iloc[3], "Max": q.iloc[4],
+                "CarryOneWeekAgo": wk
+            })
+    return pd.DataFrame(rows)
+
+def pivot_curve_outright(best_curve: pd.DataFrame):
+    p = best_curve.pivot(index='Country', columns='Box', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    existing = [b for b in box_order if b in p.columns.levels[0]]
+    p = p.reindex(columns=existing, level=0).sort_index(axis=1, level=0)
+    return p.round(1)
+
+# ---------- 4) BOXES vs Germany ----------
+def compute_box_spreads_from_synth(bond_lists, carry_dfs, yield_dfs, data: pd.DataFrame):
+    synth_carry, synth_yield, _ = build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs)
+    rows = []
+    if benchmark_country not in synth_carry:
+        return pd.DataFrame()
+
+    for country in country_list:
+        if country not in synth_carry: 
+            continue
+        for s,l in maturity_combinations:
+            if s not in synth_carry[country] or l not in synth_carry[country]: 
+                continue
+            if s not in synth_carry[benchmark_country] or l not in synth_carry[benchmark_country]:
+                continue
+
+            cS, cL = synth_carry[country][s], synth_carry[country][l]
+            yS, yL = synth_yield[country].get(s, pd.Series(dtype=float)), synth_yield[country].get(l, pd.Series(dtype=float))
+            dS, dL = synth_carry[benchmark_country][s], synth_carry[benchmark_country][l]
+            yS_d, yL_d = synth_yield[benchmark_country].get(s, pd.Series(dtype=float)), synth_yield[benchmark_country].get(l, pd.Series(dtype=float))
+            if any(s_.empty for s_ in [cS,cL,dS,dL]): 
+                continue
+
+            carry_box = float((cL.iloc[-1]-cS.iloc[-1]) - (dL.iloc[-1]-dS.iloc[-1]))
+            if abs(carry_box) > HARD_CARRY_CAP: continue
+            if not all(recent_enough(x.index) for x in [cS,cL,dS,dL]): continue
+
+            # vol via yields  ( (yL-yL_d) - (yS-yS_d) )
+            def box_diff(yS,yL,yS_d,yL_d):
+                common = yS.index & yL.index & yS_d.index & yL_d.index
+                return ((yL.reindex(common)-yL_d.reindex(common)) - (yS.reindex(common)-yS_d.reindex(common))).dropna()
+
+            diff_primary = None
+            if not any(s.empty for s in [yS,yL,yS_d,yL_d]):
+                diff_primary = box_diff(yS,yL,yS_d,yL_d)
+
+            # fallback via data
+            yS_fb   = get_data_yield_series(data, country, s)
+            yL_fb   = get_data_yield_series(data, country, l)
+            yS_d_fb = get_data_yield_series(data, benchmark_country, s)
+            yL_d_fb = get_data_yield_series(data, benchmark_country, l)
+            diff_fallback = None
+            if not any(s.empty for s in [yS_fb,yL_fb,yS_d_fb,yL_d_fb]):
+                diff_fallback = box_diff(yS_fb,yL_fb,yS_d_fb,yL_d_fb)
+
+            diff_src = choose_vol_series(diff_primary, diff_fallback)
+            if diff_src is None: 
+                continue
+            vol = vol_3m_bp(diff_src)
+
+            # quantiles
+            common_c = cS.index & cL.index & dS.index & dL.index
+            c_box_hist = ((cL.reindex(common_c)-dL.reindex(common_c)) - (cS.reindex(common_c)-dS.reindex(common_c))).dropna()
+            h = min(HIST_WINDOW, len(c_box_hist))
+            if h < 10: 
+                continue
+            q = c_box_hist[-h:].quantile([0,.25,.5,.75,1])
+            wk = c_box_hist.iloc[-8] if len(c_box_hist) >= 8 else np.nan
+
+            rows.append({
+                "Country": country,
+                "Box": f"{s}s{l}s",
+                "Carry": carry_box, "Vol": float(vol), "CarryOverVol": float(carry_box/vol) if vol else np.nan,
+                "Min": q.iloc[0], "Q25": q.iloc[1], "Q50": q.iloc[2], "Q75": q.iloc[3], "Max": q.iloc[4],
+                "CarryOneWeekAgo": wk
+            })
+    return pd.DataFrame(rows)
+
+def pivot_box(best_box: pd.DataFrame):
+    p = best_box.pivot(index='Country', columns='Box', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    existing = [b for b in box_order if b in p.columns.levels[0]]
+    p = p.reindex(columns=existing, level=0).sort_index(axis=1, level=0)
+    return p.round(1)
+
+# ---------- 5) FLY OUTRIGHT ----------
+def compute_fly_outright_from_synth(bond_lists, carry_dfs, yield_dfs, data: pd.DataFrame):
+    synth_carry, synth_yield, _ = build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs)
+    rows = []
+    for country in country_list + [benchmark_country]:
+        if country not in synth_carry: 
+            continue
+        for s,m,l in fly_combinations:
+            if not all(k in synth_carry[country] for k in [s,m,l]): 
+                continue
+            cS, cM, cL = synth_carry[country][s], synth_carry[country][m], synth_carry[country][l]
+            yS, yM, yL = synth_yield[country].get(s, pd.Series(dtype=float)), synth_yield[country].get(m, pd.Series(dtype=float)), synth_yield[country].get(l, pd.Series(dtype=float))
+            if any(s_.empty for s_ in [cS,cM,cL]): 
+                continue
+
+            W = fly_weights(s,m,l)
+            carry_fly = float(W[s]*cS.iloc[-1] + W[m]*cM.iloc[-1] + W[l]*cL.iloc[-1])
+            if abs(carry_fly) > HARD_CARRY_CAP: continue
+            if not all(recent_enough(x.index) for x in [cS,cM,cL]): continue
+
+            # vol fly = combinaison linéaire des yields – fallback via data
+            fly_primary = None
+            if not any(s.empty for s in [yS,yM,yL]):
+                fly_primary = (W[s]*yS + W[m]*yM + W[l]*yL).dropna()
+
+            yS_fb = get_data_yield_series(data, country, s)
+            yM_fb = get_data_yield_series(data, country, m)
+            yL_fb = get_data_yield_series(data, country, l)
+            fly_fallback = None
+            if not any(s.empty for s in [yS_fb,yM_fb,yL_fb]):
+                fly_fallback = (W[s]*yS_fb + W[m]*yM_fb + W[l]*yL_fb).dropna()
+
+            fly_src = choose_vol_series(fly_primary, fly_fallback)
+            if fly_src is None: 
+                continue
+            vol = vol_3m_bp(fly_src)
+
+            # quantiles
+            fly_hist = (W[s]*cS + W[m]*cM + W[l]*cL).dropna()
+            h = min(HIST_WINDOW, len(fly_hist))
+            if h < 10: 
+                continue
+            q = fly_hist[-h:].quantile([0,.25,.5,.75,1])
+            wk = fly_hist.iloc[-8] if len(fly_hist) >= 8 else np.nan
+
+            rows.append({
+                "Country": country,
+                "Fly": f"{s}s{m}s{l}s",
+                "Carry": carry_fly, "Vol": float(vol), "CarryOverVol": float(carry_fly/vol) if vol else np.nan,
+                "Min": q.iloc[0], "Q25": q.iloc[1], "Q50": q.iloc[2], "Q75": q.iloc[3], "Max": q.iloc[4],
+                "CarryOneWeekAgo": wk
+            })
+    return pd.DataFrame(rows)
+
+def pivot_fly_outright(best_fly_out: pd.DataFrame):
+    p = best_fly_out.pivot(index='Country', columns='Fly', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    existing = [f for f in fly_order if f in p.columns.levels[0]]
+    p = p.reindex(columns=existing, level=0).sort_index(axis=1, level=0)
+    return p.round(1)
+
+# ---------- 6) FLY BOXES vs Germany ----------
+def compute_fly_box_spreads_from_synth(bond_lists, carry_dfs, yield_dfs, data: pd.DataFrame):
+    synth_carry, synth_yield, _ = build_synthetic_representatives(bond_lists, carry_dfs, yield_dfs)
+    rows = []
+    if benchmark_country not in synth_carry:
+        return pd.DataFrame()
+
+    for country in country_list:
+        if country not in synth_carry: 
+            continue
+        for s,m,l in fly_combinations:
+            if not all(k in synth_carry[country] for k in [s,m,l]): 
+                continue
+            if not all(k in synth_carry[benchmark_country] for k in [s,m,l]): 
+                continue
+            cS, cM, cL = synth_carry[country][s], synth_carry[country][m], synth_carry[country][l]
+            dS, dM, dL = synth_carry[benchmark_country][s], synth_carry[benchmark_country][m], synth_carry[benchmark_country][l]
+            yS, yM, yL   = synth_yield[country].get(s, pd.Series(dtype=float)), synth_yield[country].get(m, pd.Series(dtype=float)), synth_yield[country].get(l, pd.Series(dtype=float))
+            yS_d, yM_d, yL_d = synth_yield[benchmark_country].get(s, pd.Series(dtype=float)), synth_yield[benchmark_country].get(m, pd.Series(dtype=float)), synth_yield[benchmark_country].get(l, pd.Series(dtype=float))
+            if any(s_.empty for s_ in [cS,cM,cL,dS,dM,dL]): 
+                continue
+
+            W = fly_weights(s,m,l)
+            carry_country = float(W[s]*cS.iloc[-1] + W[m]*cM.iloc[-1] + W[l]*cL.iloc[-1])
+            carry_de      = float(W[s]*dS.iloc[-1] + W[m]*dM.iloc[-1] + W[l]*dL.iloc[-1])
+            carry_fly_box = carry_country - carry_de
+            if abs(carry_fly_box) > HARD_CARRY_CAP: continue
+            if not all(recent_enough(x.index) for x in [cS,cM,cL,dS,dM,dL]): continue
+
+            # vol via yields — fallback data
+            fly_primary = None
+            if not any(s.empty for s in [yS,yM,yL,yS_d,yM_d,yL_d]):
+                common = yS.index & yM.index & yL.index & yS_d.index & yM_d.index & yL_d.index
+                fly_primary = (W[s]*(yS.reindex(common)-yS_d.reindex(common)) +
+                               W[m]*(yM.reindex(common)-yM_d.reindex(common)) +
+                               W[l]*(yL.reindex(common)-yL_d.reindex(common))).dropna()
+
+            yS_fb   = get_data_yield_series(data, country, s)
+            yM_fb   = get_data_yield_series(data, country, m)
+            yL_fb   = get_data_yield_series(data, country, l)
+            yS_d_fb = get_data_yield_series(data, benchmark_country, s)
+            yM_d_fb = get_data_yield_series(data, benchmark_country, m)
+            yL_d_fb = get_data_yield_series(data, benchmark_country, l)
+            fly_fallback = None
+            if not any(s.empty for s in [yS_fb,yM_fb,yL_fb,yS_d_fb,yM_d_fb,yL_d_fb]):
+                common_fb = yS_fb.index & yM_fb.index & yL_fb.index & yS_d_fb.index & yM_d_fb.index & yL_d_fb.index
+                fly_fallback = (W[s]*(yS_fb.reindex(common_fb)-yS_d_fb.reindex(common_fb)) +
+                                W[m]*(yM_fb.reindex(common_fb)-yM_d_fb.reindex(common_fb)) +
+                                W[l]*(yL_fb.reindex(common_fb)-yL_d_fb.reindex(common_fb))).dropna()
+
+            fly_src = choose_vol_series(fly_primary, fly_fallback)
+            if fly_src is None:
+                continue
+            vol = vol_3m_bp(fly_src)
+
+            # quantiles
+            fly_hist_c = (W[s]*cS + W[m]*cM + W[l]*cL).dropna()
+            fly_hist_d = (W[s]*dS + W[m]*dM + W[l]*dL).dropna()
+            common_c = fly_hist_c.index.intersection(fly_hist_d.index)
+            fly_box_hist = (fly_hist_c.reindex(common_c) - fly_hist_d.reindex(common_c)).dropna()
+            h = min(HIST_WINDOW, len(fly_box_hist))
+            if h < 10:
+                continue
+            q = fly_box_hist[-h:].quantile([0,.25,.5,.75,1])
+            wk = fly_box_hist.iloc[-8] if len(fly_box_hist) >= 8 else np.nan
+
+            rows.append({
+                "Country": country,
+                "Fly": f"{s}s{m}s{l}s",
+                "Carry": carry_fly_box, "Vol": float(vol), "CarryOverVol": float(carry_fly_box/vol) if vol else np.nan,
+                "Min": q.iloc[0], "Q25": q.iloc[1], "Q50": q.iloc[2], "Q75": q.iloc[3], "Max": q.iloc[4],
+                "CarryOneWeekAgo": wk
+            })
+    return pd.DataFrame(rows)
+
+def pivot_fly_box(best_fly_box: pd.DataFrame):
+    p = best_fly_box.pivot(index='Country', columns='Fly', values=['Carry','Vol'])
+    p.columns = p.columns.swaplevel(0,1)
+    existing = [f for f in fly_order if f in p.columns.levels[0]]
+    p = p.reindex(columns=existing, level=0).sort_index(axis=1, level=0)
+    return p.round(1)
+
+# ---------- Pass-through “outliers & average” ----------
+def remove_outliers_and_average_outright(df_outright):  return df_outright.copy()
+def remove_outliers_and_average_spread(df_spread):      return df_spread.copy()
+def remove_outliers_and_average_curve(df_curve):        return df_curve.copy()
+def remove_outliers_and_average_box(df_box):            return df_box.copy()
+def remove_outliers_and_average_fly_outright(df_f):     return df_f.copy()
+def remove_outliers_and_average_fly_box(df_fb):         return df_fb.copy()
