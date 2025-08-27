@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 # =========================================================
 # Dash app — Carry & Carry/Vol (Time Series + CandleStick by Maturity, 126d lookback)
+# Ultra-stable version: no list-comprehensions nor star-unpacking in layout
 # =========================================================
-from typing import Dict, List, Tuple
-import io, base64, socket, webbrowser
+
+import io
+import base64
+import socket
+import webbrowser
+
 import numpy as np
 import pandas as pd
+
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")  # headless backend
 import matplotlib.pyplot as plt
+
 import dash
 from dash import Dash, dcc, html, Input, Output, State, ALL, MATCH
 import plotly.graph_objs as go
@@ -16,7 +23,7 @@ import plotly.graph_objs as go
 # =========================
 # Load DataFrames (expected globally or via data_loader.py)
 # =========================
-def _try_get(name: str):
+def _try_get(name):
     try:
         return globals()[name]  # type: ignore[name-defined]
     except Exception:
@@ -26,106 +33,120 @@ def _try_get(name: str):
         except Exception:
             return None
 
-data = _try_get("data")
-df_Swap = _try_get("df_Swap")
+data       = _try_get("data")
+df_Swap    = _try_get("df_Swap")
 df_Mod_Dur = _try_get("df_Mod_Dur")
-df_ESTR = _try_get("df_ESTR")
-df_Repo = _try_get("df_Repo")
+df_ESTR    = _try_get("df_ESTR")
+df_Repo    = _try_get("df_Repo")
 
 # =========================
 # Config
 # =========================
-AVAILABLE_COUNTRIES = ["Germany", "Italy", "France", "Spain"]
-AVAILABLE_MATURITIES = ["1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y", "15Y", "20Y", "25Y", "30Y"]
-BUCKETS_NUM = [1, 2, 3, 4, 5, 7, 10, 15, 20, 25, 30]
+AVAILABLE_COUNTRIES  = ["Germany", "Italy", "France", "Spain"]
+AVAILABLE_MATURITIES = ["1Y","2Y","3Y","4Y","5Y","7Y","10Y","15Y","20Y","25Y","30Y"]
+BUCKETS_NUM          = [1,2,3,4,5,7,10,15,20,25,30]
+
 MAX_SERIES = 10
 DEFAULT_NUM_SERIES = 1
-WINDOW_3M = 63
-LOOKBACK_DAYS = 126
-CANDLE_FIGSIZE: Tuple[float, float] = (12.0, 5.5)
+
+WINDOW_3M     = 63   # ~3 months
+LOOKBACK_DAYS = 126  # ~6 months (candles)
+
+CANDLE_FIGSIZE = (12.0, 5.5)
 
 # =========================
 # Helpers
 # =========================
-def ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_dt_index(df):
     if not isinstance(df.index, pd.DatetimeIndex):
         df = df.copy()
         df.index = pd.to_datetime(df.index)
     return df.sort_index()
 
-def slice_last_days(s: pd.Series, days: int) -> pd.Series:
+def slice_last_days(s, days):
     s = s.dropna()
-    if s.empty: return s
+    if s.empty:
+        return s
     return s.iloc[-int(days):].copy()
 
-def matu_to_bucket(m: str) -> int:
+def matu_to_bucket(m):
     try:
         return int(str(m).upper().replace("Y", "").strip())
     except Exception:
         return np.nan  # type: ignore[return-value]
 
-def _col_yield(country: str, maturity: str) -> str:
+def _col_yield(country, maturity):
     return f"{country} {maturity}"
 
 # =========================
 # Accessors
 # =========================
-def _series_yield(country: str, maturity: str) -> pd.Series:
+def _series_yield(country, maturity):
     col = _col_yield(country, maturity)
-    if (data is None) or (col not in data.columns): raise KeyError(f"Yield column '{col}' not found in `data`.")
+    if (data is None) or (col not in data.columns):
+        raise KeyError(f"Yield column '{col}' not found in `data`.")
     return ensure_dt_index(data)[col].astype(float)
 
-def _swap_estr(maturity: str) -> pd.Series:
-    if (df_Swap is None) or (maturity not in df_Swap.columns): raise KeyError(f"Swap column '{maturity}' not found in `df_Swap`.")
+def _swap_estr(maturity):
+    if (df_Swap is None) or (maturity not in df_Swap.columns):
+        raise KeyError(f"Swap column '{maturity}' not found in `df_Swap`.")
     return ensure_dt_index(df_Swap)[maturity].astype(float)
 
-def _mod_dur(maturity: str) -> pd.Series:
-    if (df_Mod_Dur is None) or (maturity not in df_Mod_Dur.columns): raise KeyError(f"Modified duration '{maturity}' not found in `df_Mod_Dur`.")
+def _mod_dur(maturity):
+    if (df_Mod_Dur is None) or (maturity not in df_Mod_Dur.columns):
+        raise KeyError(f"Modified duration '{maturity}' not found in `df_Mod_Dur`.")
     return ensure_dt_index(df_Mod_Dur)[maturity].astype(float)
 
-def _repo(country: str) -> pd.Series:
-    if (df_Repo is None) or (country not in df_Repo.columns): raise KeyError(f"Repo column '{country}' not found in `df_Repo`.")
+def _repo(country):
+    if (df_Repo is None) or (country not in df_Repo.columns):
+        raise KeyError(f"Repo column '{country}' not found in `df_Repo`.")
     return ensure_dt_index(df_Repo)[country].astype(float)
 
-def _estr3m_series() -> pd.Series:
-    if (df_ESTR is None) or (df_ESTR.shape[1] < 1): raise KeyError("`df_ESTR` must have a single column with the 3M ESTR series.")
+def _estr3m_series():
+    if (df_ESTR is None) or (df_ESTR.shape[1] < 1):
+        raise KeyError("`df_ESTR` must have a single column with the 3M ESTR series.")
     return ensure_dt_index(df_ESTR).iloc[:, 0].astype(float)
 
 # =========================
 # Core calculations
 # =========================
-def compute_carry_3m(country: str, maturity: str) -> pd.Series:
-    """Carry 3M (bps) = ((Yield - ESTR Swap(maturity) - (Repo - ESTR 3M)) / (4 * ModifiedDuration)) * 100"""
-    y = _series_yield(country, maturity)
-    s = _swap_estr(maturity)
-    md = _mod_dur(maturity).replace(0, np.nan)
-    repo = _repo(country)
-    estr3 = _estr3m_series()
+def compute_carry_3m(country, maturity):
+    """
+    Carry 3M (bps) = ((Yield - ESTR Swap(maturity) - (Repo - ESTR 3M)) / (4 * ModifiedDuration)) * 100
+    """
+    y     = _series_yield(country, maturity)         # %
+    s     = _swap_estr(maturity)                     # %
+    md    = _mod_dur(maturity).replace(0, np.nan)    # unitless
+    repo  = _repo(country)                           # %
+    estr3 = _estr3m_series()                         # %
+
     df = pd.concat({"yield": y, "swap": s, "mod_dur": md, "repo": repo, "estr3m": estr3}, axis=1).dropna()
     carry_bps = ((df["yield"] - df["swap"] - (df["repo"] - df["estr3m"])) / (4.0 * df["mod_dur"])) * 100.0
     carry_bps.name = f"{country} {maturity} Carry 3M (bps)"
     return carry_bps
 
-def compute_vol_3m(country: str, maturity: str) -> pd.Series:
-    """Vol 3M (bps/day) = std of daily changes in yield% × 100 over 63 obs"""
+def compute_vol_3m(country, maturity):
+    """
+    Vol 3M (bps/day) = std of daily changes in yield% × 100 over 63 obs
+    """
     y = _series_yield(country, maturity).dropna()
     dy_bps = (y * 100.0).diff()
     vol = dy_bps.rolling(WINDOW_3M, min_periods=WINDOW_3M // 2).std()
     vol.name = f"{country} {maturity} Vol 3M (bps/day)"
     return vol
 
-def compute_carry_over_vol(country: str, maturity: str) -> pd.Series:
+def compute_carry_over_vol(country, maturity):
     carry_bps = compute_carry_3m(country, maturity)
-    vol_bps = compute_vol_3m(country, maturity)
-    df = pd.concat([carry_bps, vol_bps], axis=1).dropna()
-    cov = df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)
-    cov.name = f"{country} {maturity} Carry/Vol"
+    vol_bps   = compute_vol_3m(country, maturity)
+    df        = pd.concat([carry_bps, vol_bps], axis=1).dropna()
+    cov       = df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)
+    cov.name  = f"{country} {maturity} Carry/Vol"
     return cov
 
 # =========================
 # Matplotlib → base64 PNG
 # =========================
-def _to_png(fig) -> str:
+def _to_png(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
     plt.close(fig)
@@ -133,182 +154,439 @@ def _to_png(fig) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.read()).decode("ascii")
 
 # =========================
-# Candlestick (custom style)
+# Candlestick helpers
 # =========================
-def _draw_candles(ax: plt.Axes, rows: pd.DataFrame, title: str, xlabel: str, ylabel: str) -> None:
-    """rows columns: ["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"]"""
-    ax.set_xticks(BUCKETS_NUM); ax.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM], rotation=0)
+def _draw_candles(ax, rows, title, xlabel, ylabel):
+    """
+    rows columns: ["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"]
+    """
+    ax.set_xticks(BUCKETS_NUM)
+    ax.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM], rotation=0)
+
     label_added = False
     for _, row in rows.iterrows():
         b = row.get("Bucket", np.nan)
-        if not np.isfinite(b): continue
-        x = int(b)
-        min_v = float(row.get("Min", np.nan)); max_v = float(row.get("Max", np.nan))
-        q25 = float(row.get("Q25", np.nan)); q50 = float(row.get("Q50", np.nan)); q75 = float(row.get("Q75", np.nan))
-        curr = float(row.get("CarryOverVol", np.nan)); prev = row.get("CarryOneWeekAgo", np.nan)
-        if any(np.isnan(v) for v in [min_v, max_v, q25, q50, q75, curr]): continue
+        if not np.isfinite(b):
+            continue
+
+        x     = int(b)
+        min_v = float(row.get("Min", np.nan))
+        max_v = float(row.get("Max", np.nan))
+        q25   = float(row.get("Q25", np.nan))
+        q50   = float(row.get("Q50", np.nan))
+        q75   = float(row.get("Q75", np.nan))
+        curr  = float(row.get("CarryOverVol", np.nan))
+        prev  = row.get("CarryOneWeekAgo", np.nan)
+
+        if any(np.isnan(v) for v in [min_v, max_v, q25, q50, q75, curr]):
+            continue
+
         ax.plot([x, x], [min_v, max_v], color="black", linewidth=2)
         ax.plot([x, x], [q25, q75], color="black", linewidth=8, alpha=0.5)
         ax.plot([x, x], [q25, q75], color="white", linewidth=6, alpha=1.0)
         ax.plot(x, q50, color="black", marker="_", markersize=6)
         ax.plot(x, curr, color="red", marker="_", markersize=10, label="Current" if not label_added else "")
-        if pd.notna(prev): ax.plot(x, float(prev), color="steelblue", marker="_", markersize=8, label="1W ago" if not label_added else "")
+        if pd.notna(prev):
+            ax.plot(x, float(prev), color="steelblue", marker="_", markersize=8, label="1W ago" if not label_added else "")
         label_added = True
-    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.legend(loc="upper right"); ax.grid(True); plt.tight_layout()
 
-def _rows_from_series_for_draw(series: pd.Series, x_bucket: int, current_value: float, one_week_ago_value: float) -> pd.DataFrame:
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.legend(loc="upper right")
+    ax.grid(True)
+    plt.tight_layout()
+
+def _rows_from_series_for_draw(series, x_bucket, current_value, one_week_ago_value):
     s = series.dropna()
-    if s.empty: return pd.DataFrame(columns=["Bucket", "Min", "Max", "Q25", "Q50", "Q75", "CarryOverVol", "CarryOneWeekAgo"])
+    if s.empty:
+        return pd.DataFrame(columns=["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"])
     win = slice_last_days(s, LOOKBACK_DAYS)
-    if win.empty: return pd.DataFrame(columns=["Bucket", "Min", "Max", "Q25", "Q50", "Q75", "CarryOverVol", "CarryOneWeekAgo"])
+    if win.empty:
+        return pd.DataFrame(columns=["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"])
     q = win.quantile([0.25, 0.5, 0.75])
     return pd.DataFrame([{
-        "Bucket": int(x_bucket), "Min": float(win.min()), "Max": float(win.max()),
-        "Q25": float(q.loc[0.25]), "Q50": float(q.loc[0.5]), "Q75": float(q.loc[0.75]),
+        "Bucket": int(x_bucket),
+        "Min": float(win.min()),
+        "Max": float(win.max()),
+        "Q25": float(q.loc[0.25]),
+        "Q50": float(q.loc[0.5]),
+        "Q75": float(q.loc[0.75]),
         "CarryOverVol": float(current_value),
         "CarryOneWeekAgo": float(one_week_ago_value) if np.isfinite(one_week_ago_value) else np.nan
-    }])
+    }]])
 
-def _shift_business_days_to_past(s: pd.Series, n: int = 5) -> float:
+def _shift_business_days_to_past(s, n=5):
     s = s.dropna()
-    if s.empty: return np.nan
+    if s.empty:
+        return np.nan
     sb = s.asfreq("B").ffill()
     last = sb.index.max()
     val = sb.shift(n).reindex([last]).iloc[0]
     return float(val) if np.isfinite(val) else np.nan
 
-def _build_candlestick_tables_for_country(country: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rows_carry_list: List[pd.DataFrame] = []; rows_cov_list: List[pd.DataFrame] = []
+def _build_candlestick_tables_for_country(country):
+    rows_carry_list = []
+    rows_cov_list   = []
+
     for m in AVAILABLE_MATURITIES:
         bucket = matu_to_bucket(m)
-        if not np.isfinite(bucket): continue
+        if not np.isfinite(bucket):
+            continue
         try:
-            carry_bps = compute_carry_3m(country, m); cov = compute_carry_over_vol(country, m)
+            carry_bps = compute_carry_3m(country, m)         # bps
+            cov       = compute_carry_over_vol(country, m)   # ratio
         except Exception:
             continue
+
         curr_carry = float(carry_bps.dropna().iloc[-1]) if not carry_bps.dropna().empty else np.nan
-        curr_cov = float(cov.dropna().iloc[-1]) if not cov.dropna().empty else np.nan
-        carry_1w = _shift_business_days_to_past(carry_bps, n=5) if not carry_bps.dropna().empty else np.nan
-        cov_1w = _shift_business_days_to_past(cov, n=5) if not cov.dropna().empty else np.nan
+        curr_cov   = float(cov.dropna().iloc[-1])       if not cov.dropna().empty       else np.nan
+        carry_1w   = _shift_business_days_to_past(carry_bps, n=5) if not carry_bps.dropna().empty else np.nan
+        cov_1w     = _shift_business_days_to_past(cov, n=5)       if not cov.dropna().empty       else np.nan
+
         if not slice_last_days(carry_bps, LOOKBACK_DAYS).empty:
-            rows_carry_list.append(_rows_from_series_for_draw(carry_bps, int(bucket), curr_carry, carry_1w))
+            rows_carry_list.append(
+                _rows_from_series_for_draw(
+                    series=carry_bps,
+                    x_bucket=int(bucket),
+                    current_value=curr_carry,
+                    one_week_ago_value=carry_1w
+                )
+            )
+
         if not slice_last_days(cov, LOOKBACK_DAYS).empty:
-            rows_cov_list.append(_rows_from_series_for_draw(cov, int(bucket), curr_cov, cov_1w))
-    rows_carry = pd.concat(rows_carry_list, ignore_index=True) if rows_carry_list else pd.DataFrame(columns=["Bucket", "Min", "Max", "Q25", "Q50", "Q75", "CarryOverVol", "CarryOneWeekAgo"])
-    rows_cov = pd.concat(rows_cov_list, ignore_index=True) if rows_cov_list else pd.DataFrame(columns=["Bucket", "Min", "Max", "Q25", "Q50", "Q75", "CarryOverVol", "CarryOneWeekAgo"])
-    if not rows_carry.empty: rows_carry = rows_carry.sort_values("Bucket")
-    if not rows_cov.empty: rows_cov = rows_cov.sort_values("Bucket")
+            rows_cov_list.append(
+                _rows_from_series_for_draw(
+                    series=cov,
+                    x_bucket=int(bucket),
+                    current_value=curr_cov,
+                    one_week_ago_value=cov_1w
+                )
+            )
+
+    if rows_carry_list:
+        rows_carry = pd.concat(rows_carry_list, ignore_index=True)
+    else:
+        rows_carry = pd.DataFrame(columns=["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"])
+
+    if rows_cov_list:
+        rows_cov = pd.concat(rows_cov_list, ignore_index=True)
+    else:
+        rows_cov = pd.DataFrame(columns=["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"])
+
+    if not rows_carry.empty:
+        rows_carry = rows_carry.sort_values("Bucket")
+    if not rows_cov.empty:
+        rows_cov = rows_cov.sort_values("Bucket")
+
     return rows_carry, rows_cov
 
 # =========================
 # Plotly helpers (time series)
 # =========================
-def fig_lines(series_dict: Dict[str, pd.Series], title: str, ylab: str) -> go.Figure:
+def fig_lines(series_dict, title, ylab):
     fig = go.Figure()
-    for label, s in series_dict.items():
-        s = s.dropna()
-        if s.empty: continue
+    for label in series_dict:
+        s = series_dict[label].dropna()
+        if s.empty:
+            continue
         fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=label))
-    fig.update_layout(template="plotly_white", title=title, xaxis=dict(tickformat="%Y"), yaxis=dict(title=ylab), legend=dict(orientation="h", y=1.02, x=1, xanchor="right"), margin=dict(l=50, r=20, t=40, b=40))
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis=dict(tickformat="%Y"),
+        yaxis=dict(title=ylab),
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+        margin=dict(l=50, r=20, t=40, b=40)
+    )
     return fig
 
 # =========================
 # Dash app
 # =========================
-app = Dash(__name__, suppress_callback_exceptions=True); app.title = "Carry Dashboard"
+app = Dash(__name__, suppress_callback_exceptions=True)
+app.title = "Carry Dashboard"
 
-def _country_options(): return [{"label": c, "value": c} for c in AVAILABLE_COUNTRIES]
-def _maturity_options(): return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
+def _country_options():
+    return [{"label": c, "value": c} for c in AVAILABLE_COUNTRIES]
 
-def _build_candles_grid_children() -> List[html.Div]:
-    rows: List[html.Div] = []
-    for ctry in AVAILABLE_COUNTRIES:
-        left_col = html.Div(children=[html.H4(f"CandleStick Carry vs Maturity — {ctry}", style={"margin": "4px 0 8px 0}), html.Img(id={"type": "mpl-carry", "country": ctry}, style={"width": "100%", "height": "420px", "objectFit": "contain", "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"})])
-        right_col = html.Div(children=[html.H4(f"CandleStick Carry/Vol vs Maturity — {ctry}", style={"margin": "4px 0 8px 0}), html.Img(id={"type": "mpl-cov", "country": ctry}, style={"width": "100%", "height": "420px", "objectFit": "contain", "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"})])
-        row = html.Div(children=[left_col, right_col], style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "columnGap": "16px", "alignItems": "stretch", "marginBottom": "16px"})
-        rows.append(row)
-    return rows
+def _maturity_options():
+    return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
+
+# Build candles grid children explicitly (no comprehensions)
+candles_grid_children = []
+
+# Germany row
+row_de = html.Div(
+    children=[
+        html.Div(children=[
+            html.H4("CandleStick Carry vs Maturity — Germany", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-carry", "country": "Germany"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ]),
+        html.Div(children=[
+            html.H4("CandleStick Carry/Vol vs Maturity — Germany", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-cov", "country": "Germany"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid " "#eee", "backgroundColor": "#fff"}
+            )
+        ])
+    ],
+    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "columnGap": "16px",
+           "alignItems": "stretch", "marginBottom": "16px"}
+)
+candles_grid_children.append(row_de)
+
+# Italy row
+row_it = html.Div(
+    children=[
+        html.Div(children=[
+            html.H4("CandleStick Carry vs Maturity — Italy", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-carry", "country": "Italy"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ]),
+        html.Div(children=[
+            html.H4("CandleStick Carry/Vol vs Maturity — Italy", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-cov", "country": "Italy"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ])
+    ],
+    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "columnGap": "16px",
+           "alignItems": "stretch", "marginBottom": "16px"}
+)
+candles_grid_children.append(row_it)
+
+# France row
+row_fr = html.Div(
+    children=[
+        html.Div(children=[
+            html.H4("CandleStick Carry vs Maturity — France", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-carry", "country": "France"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ]),
+        html.Div(children=[
+            html.H4("CandleStick Carry/Vol vs Maturity — France", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-cov", "country": "France"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ])
+    ],
+    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "columnGap": "16px",
+           "alignItems": "stretch", "marginBottom": "16px"}
+)
+candles_grid_children.append(row_fr)
+
+# Spain row
+row_es = html.Div(
+    children=[
+        html.Div(children=[
+            html.H4("CandleStick Carry vs Maturity — Spain", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-carry", "country": "Spain"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ]),
+        html.Div(children=[
+            html.H4("CandleStick Carry/Vol vs Maturity — Spain", style={"margin": "4px 0 8px 0"}),
+            html.Img(
+                id={"type": "mpl-cov", "country": "Spain"},
+                style={"width": "100%", "height": "420px", "objectFit": "contain",
+                       "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"}
+            )
+        ])
+    ],
+    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "columnGap": "16px",
+           "alignItems": "stretch", "marginBottom": "8px"}
+)
+candles_grid_children.append(row_es)
 
 app.layout = html.Div(children=[
     html.H2("📈 Carry & Carry/Vol — Dashboard"),
     html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
+
+    # Controls
     html.Div(children=[
-        html.Div(children=[html.Label("How many series on the same chart?"), dcc.Dropdown(id="num-series", options=[{"label": str(i), "value": i} for i in range(1, MAX_SERIES + 1)], value=DEFAULT_NUM_SERIES, clearable=False, style={"width": "220px"})], style={"display": "inline-block", "verticalAlign": "top", "marginRight": "24px"}),
+        html.Div(children=[
+            html.Label("How many series on the same chart?"),
+            dcc.Dropdown(
+                id="num-series",
+                options=[{"label": str(i), "value": i} for i in range(1, MAX_SERIES + 1)],
+                value=DEFAULT_NUM_SERIES,
+                clearable=False,
+                style={"width": "220px"}
+            )
+        ], style={"display": "inline-block", "verticalAlign": "top", "marginRight": "24px"}),
+
         html.Div(id="dynamic-pickers", style={"display": "inline-block", "verticalAlign": "top"})
     ], style={"marginBottom": "6px"}),
-    html.Div(children=[html.Span("Carry 3M formula (in bps): "), html.Code("((Yield − matched maturity ESTR swap − (Repo − ESTR 3M)) / (4 × Modified Duration)) × 100")], style={"marginBottom": "10px", "color": "#444"}),
+
+    # Formula
     html.Div(children=[
-        html.Div(children=[dcc.Graph(id="fig_carry", config={"displaylogo": False})], style={"width": "100%", "display": "inline-block", "marginBottom": "8px"}),
-        html.Div(children=[dcc.Graph(id="fig_carryvol", config={"displaylogo": False})], style={"width": "100%", "display": "inline-block"})
+        html.Span("Carry 3M formula (in bps): "),
+        html.Code("((Yield − matched maturity ESTR swap − (Repo − ESTR 3M)) / (4 × Modified Duration)) × 100")
+    ], style={"marginBottom": "10px", "color": "#444"}),
+
+    # Time-series
+    html.Div(children=[
+        html.Div(children=[dcc.Graph(id="fig_carry", config={"displaylogo": False})],
+                 style={"width": "100%", "display": "inline-block", "marginBottom": "8px"}),
+        html.Div(children=[dcc.Graph(id="fig_carryvol", config={"displaylogo": False})],
+                 style={"width": "100%", "display": "inline-block"})
     ]),
+
     html.Hr(),
+
+    # Candlestick section
     html.H3("CandleStick Plots — 6M History (126d) or Max Available", style={"marginBottom": "6px"}),
-    html.Div("Each chart shows 11 maturities on X: 1Y,2Y,3Y,4Y,5Y,7Y,10Y,15Y,20Y,25Y,30Y.", style={"marginBottom": "8px", "color": "#555"}),
-    html.Div(id="candles-grid", children=_build_candles_grid_children(), style={"display": "grid", "rowGap": "6px"}),
+    html.Div("Each chart shows 11 maturities on X: 1Y,2Y,3Y,4Y,5Y,7Y,10Y,15Y,20Y,25Y,30Y.",
+             style={"marginBottom": "8px", "color": "#555"}),
+
+    html.Div(id="candles-grid", children=candles_grid_children, style={"display": "grid", "rowGap": "6px"}),
+
     html.Div(id="init-trigger", style={"display": "none"})
 ])
 
 # =========================
 # Callbacks
 # =========================
-@app.callback(Output("dynamic-pickers", "children"), Input("num-series", "value"))
+@app.callback(
+    Output("dynamic-pickers", "children"),
+    Input("num-series", "value")
+)
 def pickers(n):
-    try: n = int(n or 1)
-    except Exception: n = 1
-    rows: List[html.Div] = []
+    try:
+        n = int(n or 1)
+    except Exception:
+        n = 1
+
+    rows = []
     for i in range(1, n + 1):
         row = html.Div(children=[
             html.Label(f"Series {i} — Country & Maturity", style={"display": "block", "marginBottom": "2px"}),
-            dcc.Dropdown(id={"type": "country", "i": i}, options=_country_options(), placeholder="Country", clearable=True, style={"width": "240px", "display": "inline-block", "marginRight": "8px"}),
-            dcc.Dropdown(id={"type": "maturity", "i": i}, options=_maturity_options(), placeholder="Maturity", clearable=True, style={"width": "160px", "display": "inline-block"})
+            dcc.Dropdown(
+                id={"type": "country", "i": i},
+                options=_country_options(),
+                placeholder="Country",
+                clearable=True,
+                style={"width": "240px", "display": "inline-block", "marginRight": "8px"}
+            ),
+            dcc.Dropdown(
+                id={"type": "maturity", "i": i},
+                options=_maturity_options(),
+                placeholder="Maturity",
+                clearable=True,
+                style={"width": "160px", "display": "inline-block"}
+            )
         ], style={"marginBottom": "6px"})
         rows.append(row)
+
     return rows
 
-@app.callback(Output("fig_carry", "figure"), Output("fig_carryvol", "figure"), Output("warn-data", "children"), Input("num-series", "value"), Input({"type": "country", "i": ALL}, "value"), Input({"type": "maturity", "i": ALL}, "value"))
+@app.callback(
+    Output("fig_carry", "figure"),
+    Output("fig_carryvol", "figure"),
+    Output("warn-data", "children"),
+    Input("num-series", "value"),
+    Input({"type": "country", "i": ALL}, "value"),
+    Input({"type": "maturity", "i": ALL}, "value")
+)
 def update_ts(_n, countries, mats):
-    empty = go.Figure(); empty.update_layout(template="plotly_white")
-    if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]): return empty, empty, "Missing DataFrames. Provide `data`, `df_Swap`, `df_Mod_Dur`, `df_ESTR`, `df_Repo`."
-    series_carry: Dict[str, pd.Series] = {}; series_cov: Dict[str, pd.Series] = {}
-    countries = countries or []; mats = mats or []
+    empty = go.Figure()
+    empty.update_layout(template="plotly_white")
+
+    if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]):
+        return empty, empty, "Missing DataFrames. Provide `data`, `df_Swap`, `df_Mod_Dur`, `df_ESTR`, `df_Repo`."
+
+    series_carry = {}
+    series_cov   = {}
+
+    countries = countries or []
+    mats      = mats or []
     for c, m in zip(countries, mats):
-        if not c or not m: continue
+        if not c or not m:
+            continue
         label = f"{c} {m}"
         try:
             series_carry[label] = compute_carry_3m(c, m)
-            series_cov[label] = compute_carry_over_vol(c, m)
+            series_cov[label]   = compute_carry_over_vol(c, m)
         except Exception:
             continue
+
     fig1 = fig_lines(series_carry, "Carry 3M over time", "Carry 3M (bps)")
-    fig2 = fig_lines(series_cov, "Carry/Vol 3M over time", "Carry/Vol (bps per bps/day)")
+    fig2 = fig_lines(series_cov,   "Carry/Vol 3M over time", "Carry/Vol (bps per bps/day)")
     return fig1, fig2, ""
 
-@app.callback(Output({"type": "mpl-carry", "country": MATCH}, "src"), Output({"type": "mpl-cov", "country": MATCH}, "src"), Input("init-trigger", "children"), State({"type": "mpl-carry", "country": MATCH}, "id"))
+@app.callback(
+    Output({"type": "mpl-carry", "country": MATCH}, "src"),
+    Output({"type": "mpl-cov",   "country": MATCH}, "src"),
+    Input("init-trigger", "children"),
+    State({"type": "mpl-carry", "country": MATCH}, "id")
+)
 def render_candles(_, idstate):
-    if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]): blank = "data:image/png;base64,"; return blank, blank
+    if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]):
+        blank = "data:image/png;base64,"
+        return blank, blank
+
     ctry = idstate["country"]
+
     try:
         rows_carry, rows_cov = _build_candlestick_tables_for_country(ctry)
     except Exception:
-        blank = "data:image/png;base64,"; return blank, blank
+        blank = "data:image/png;base64,"
+        return blank, blank
+
+    # Carry (bps)
     fig1, ax1 = plt.subplots(figsize=CANDLE_FIGSIZE)
     if rows_carry.empty:
-        ax1.set_title(f"CandleStick Carry vs Maturity — {ctry}"); ax1.set_xlabel("Maturity"); ax1.set_ylabel("Carry 3M (bps)")
-        ax1.set_xticks(BUCKETS_NUM); ax1.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM]); ax1.grid(True); plt.tight_layout()
+        ax1.set_title(f"CandleStick Carry vs Maturity — {ctry}")
+        ax1.set_xlabel("Maturity")
+        ax1.set_ylabel("Carry 3M (bps)")
+        ax1.set_xticks(BUCKETS_NUM)
+        ax1.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM])
+        ax1.grid(True)
+        plt.tight_layout()
     else:
         _draw_candles(ax1, rows_carry, title=f"CandleStick Carry vs Maturity — {ctry}", xlabel="Maturity", ylabel="Carry 3M (bps)")
     img1 = _to_png(fig1)
+
+    # Carry/Vol (ratio)
     fig2, ax2 = plt.subplots(figsize=CANDLE_FIGSIZE)
     if rows_cov.empty:
-        ax2.set_title(f"CandleStick Carry/Vol vs Maturity — {ctry}"); ax2.set_xlabel("Maturity"); ax2.set_ylabel("Carry/Vol")
-        ax2.set_xticks(BUCKETS_NUM); ax2.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM]); ax2.grid(True); plt.tight_layout()
+        ax2.set_title(f"CandleStick Carry/Vol vs Maturity — {ctry}")
+        ax2.set_xlabel("Maturity")
+        ax2.set_ylabel("Carry/Vol")
+        ax2.set_xticks(BUCKETS_NUM)
+        ax2.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM])
+        ax2.grid(True)
+        plt.tight_layout()
     else:
         _draw_candles(ax2, rows_cov, title=f"CandleStick Carry/Vol vs Maturity — {ctry}", xlabel="Maturity", ylabel="Carry/Vol")
     img2 = _to_png(fig2)
+
     return img1, img2
 
-@app.callback(Output("init-trigger", "children"), Input("num-series", "value"))
-def trig(_): return "go"
+@app.callback(
+    Output("init-trigger", "children"),
+    Input("num-series", "value")
+)
+def trig(_):
+    return "go"
 
 # =========================
 # Main
@@ -316,13 +594,23 @@ def trig(_): return "go"
 if __name__ == "__main__":
     def get_local_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try: s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]
-        except Exception: ip = "127.0.0.1"
-        finally: s.close()
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
         return ip
+
     host, port = "0.0.0.0", 8057
     local_ip = get_local_ip()
-    print("\n================= SHARE THIS ================="); print(f"Local (you) : http://localhost:{port}"); print(f"LAN (team)  : http://{local_ip}:{port}"); print("==============================================\n")
-    try: webbrowser.open(f"http://localhost:{port}")
-    except Exception: pass
+    print("\n================= SHARE THIS =================")
+    print(f"Local (you) : http://localhost:{port}")
+    print(f"LAN (team)  : http://{local_ip}:{port}")
+    print("==============================================\n")
+    try:
+        webbrowser.open(f"http://localhost:{port}")
+    except Exception:
+        pass
     app.run_server(host=host, port=port, debug=False)
