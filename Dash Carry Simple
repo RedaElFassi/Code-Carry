@@ -34,24 +34,25 @@ def _try_get(name: str):
         except Exception:
             return None
 
-data       = _try_get("data")
-df_Swap    = _try_get("df_Swap")
+
+data = _try_get("data")
+df_Swap = _try_get("df_Swap")
 df_Mod_Dur = _try_get("df_Mod_Dur")
-df_ESTR    = _try_get("df_ESTR")
-df_Repo    = _try_get("df_Repo")
+df_ESTR = _try_get("df_ESTR")
+df_Repo = _try_get("df_Repo")
 
 
 # =========================
 # Config
 # =========================
-AVAILABLE_COUNTRIES  = ["Germany", "Italy", "France", "Spain"]
+AVAILABLE_COUNTRIES = ["Germany", "Italy", "France", "Spain"]
 AVAILABLE_MATURITIES = ["1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y", "15Y", "20Y", "25Y", "30Y"]
-BUCKETS_NUM          = [1, 2, 3, 4, 5, 7, 10, 15, 20, 25, 30]
+BUCKETS_NUM = [1, 2, 3, 4, 5, 7, 10, 15, 20, 25, 30]
 
 MAX_SERIES = 10
 DEFAULT_NUM_SERIES = 1
 
-WINDOW_3M     = 63   # ~ 3 months (vol)
+WINDOW_3M = 63     # ~ 3 months (vol)
 LOOKBACK_DAYS = 126  # ~ 6 months for candlesticks
 
 CANDLE_FIGSIZE: Tuple[float, float] = (12.0, 5.5)
@@ -126,11 +127,11 @@ def compute_carry_3m(country: str, maturity: str) -> pd.Series:
     """
     Carry 3M (bps) = ((Yield - ESTR Swap(maturity) - (Repo - ESTR 3M)) / (4 * ModifiedDuration)) * 100
     """
-    y     = _series_yield(country, maturity)         # %
-    s     = _swap_estr(maturity)                     # %
-    md    = _mod_dur(maturity).replace(0, np.nan)    # unitless
-    repo  = _repo(country)                           # %
-    estr3 = _estr3m_series()                         # %
+    y = _series_yield(country, maturity)  # %
+    s = _swap_estr(maturity)              # %
+    md = _mod_dur(maturity).replace(0, np.nan)  # unitless
+    repo = _repo(country)                 # %
+    estr3 = _estr3m_series()              # %
 
     df = pd.concat({"yield": y, "swap": s, "mod_dur": md, "repo": repo, "estr3m": estr3}, axis=1).dropna()
     carry_bps = ((df["yield"] - df["swap"] - (df["repo"] - df["estr3m"])) / (4.0 * df["mod_dur"])) * 100.0
@@ -151,10 +152,10 @@ def compute_vol_3m(country: str, maturity: str) -> pd.Series:
 
 def compute_carry_over_vol(country: str, maturity: str) -> pd.Series:
     carry_bps = compute_carry_3m(country, maturity)
-    vol_bps   = compute_vol_3m(country, maturity)
-    df        = pd.concat([carry_bps, vol_bps], axis=1).dropna()
-    cov       = df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)
-    cov.name  = f"{country} {maturity} Carry/Vol"
+    vol_bps = compute_vol_3m(country, maturity)
+    df = pd.concat([carry_bps, vol_bps], axis=1).dropna()
+    cov = df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)
+    cov.name = f"{country} {maturity} Carry/Vol"
     return cov
 
 
@@ -185,14 +186,14 @@ def _draw_candles(ax: plt.Axes, rows: pd.DataFrame, title: str, xlabel: str, yla
         if not np.isfinite(b):
             continue
 
-        x     = int(b)
+        x = int(b)
         min_v = float(row.get("Min", np.nan))
         max_v = float(row.get("Max", np.nan))
-        q25   = float(row.get("Q25", np.nan))
-        q50   = float(row.get("Q50", np.nan))
-        q75   = float(row.get("Q75", np.nan))
-        curr  = float(row.get("CarryOverVol", np.nan))
-        prev  = row.get("CarryOneWeekAgo", np.nan)
+        q25 = float(row.get("Q25", np.nan))
+        q50 = float(row.get("Q50", np.nan))
+        q75 = float(row.get("Q75", np.nan))
+        curr = float(row.get("CarryOverVol", np.nan))
+        prev = row.get("CarryOneWeekAgo", np.nan)
 
         if any(np.isnan(v) for v in [min_v, max_v, q25, q50, q75, curr]):
             continue
@@ -249,7 +250,7 @@ def _shift_business_days_to_past(s: pd.Series, n: int = 5) -> float:
 
 def _build_candlestick_tables_for_country(country: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows_carry_list: List[pd.DataFrame] = []
-    rows_cov_list:   List[pd.DataFrame] = []
+    rows_cov_list: List[pd.DataFrame] = []
 
     for m in AVAILABLE_MATURITIES:
         bucket = matu_to_bucket(m)
@@ -258,14 +259,14 @@ def _build_candlestick_tables_for_country(country: str) -> Tuple[pd.DataFrame, p
 
         try:
             carry_bps = compute_carry_3m(country, m)         # bps
-            cov       = compute_carry_over_vol(country, m)   # ratio
+            cov = compute_carry_over_vol(country, m)         # ratio
         except Exception:
             continue
 
         curr_carry = float(carry_bps.dropna().iloc[-1]) if not carry_bps.dropna().empty else np.nan
-        curr_cov   = float(cov.dropna().iloc[-1])       if not cov.dropna().empty       else np.nan
-        carry_1w   = _shift_business_days_to_past(carry_bps, n=5) if not carry_bps.dropna().empty else np.nan
-        cov_1w     = _shift_business_days_to_past(cov, n=5)       if not cov.dropna().empty       else np.nan
+        curr_cov = float(cov.dropna().iloc[-1]) if not cov.dropna().empty else np.nan
+        carry_1w = _shift_business_days_to_past(carry_bps, n=5) if not carry_bps.dropna().empty else np.nan
+        cov_1w = _shift_business_days_to_past(cov, n=5) if not cov.dropna().empty else np.nan
 
         if not slice_last_days(carry_bps, LOOKBACK_DAYS).empty:
             rows_carry_list.append(
@@ -518,28 +519,28 @@ def update_ts(_n, countries, mats):
         return empty, empty, "Missing DataFrames. Provide `data`, `df_Swap`, `df_Mod_Dur`, `df_ESTR`, `df_Repo`."
 
     series_carry: Dict[str, pd.Series] = {}
-    series_cov:   Dict[str, pd.Series] = {}
+    series_cov: Dict[str, pd.Series] = {}
 
     countries = countries or []
-    mats      = mats or []
+    mats = mats or []
     for c, m in zip(countries, mats):
         if not c or not m:
             continue
         label = f"{c} {m}"
         try:
             series_carry[label] = compute_carry_3m(c, m)
-            series_cov[label]   = compute_carry_over_vol(c, m)
+            series_cov[label] = compute_carry_over_vol(c, m)
         except Exception:
             continue
 
     fig1 = fig_lines(series_carry, "Carry 3M over time", "Carry 3M (bps)")
-    fig2 = fig_lines(series_cov,   "Carry/Vol 3M over time", "Carry/Vol (bps per bps/day)")
+    fig2 = fig_lines(series_cov, "Carry/Vol 3M over time", "Carry/Vol (bps per bps/day)")
     return fig1, fig2, ""
 
 
 @app.callback(
     Output({"type": "mpl-carry", "country": MATCH}, "src"),
-    Output({"type": "mpl-cov",   "country": MATCH}, "src"),
+    Output({"type": "mpl-cov", "country": MATCH}, "src"),
     Input("init-trigger", "children"),
     State({"type": "mpl-carry", "country": MATCH}, "id")
 )
@@ -621,4 +622,3 @@ if __name__ == "__main__":
     except Exception:
         pass
     app.run_server(host=host, port=port, debug=False)
-
