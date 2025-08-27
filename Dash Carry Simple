@@ -1,0 +1,514 @@
+# -*- coding: utf-8 -*-
+# =========================================================
+# Dash app — Carry & Carry/Vol (Time Series + Candlestick-like, 126d lookback)
+# =========================================================
+from typing import Dict, Optional, List, Tuple
+
+import io, base64, socket, webbrowser
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # for server/headless
+import matplotlib.pyplot as plt
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, MATCH, ALL
+import plotly.graph_objs as go
+
+# =========================
+# Try to locate required DataFrames
+# =========================
+# We expect the following to be available in the Python environment or data_loader:
+# - data:       yields, columns "Country Matu" e.g. "France 10Y"
+# - df_Swap:    ESTR swap curve, columns maturities: "1Y","2Y",...
+# - df_Mod_Dur: Modified durations, same maturity columns
+# - df_ESTR:    Single column (3M ESTR series)
+# - df_Repo:    Repo rates by country, columns: "France","Germany","Italy","Spain"
+def _try_get(name: str):
+    try:
+        return globals()[name]  # type: ignore[name-defined]
+    except Exception:
+        try:
+            from data_loader import __dict__ as dl  # type: ignore
+            return dl.get(name, None)
+        except Exception:
+            return None
+
+data       = _try_get("data")
+df_Swap    = _try_get("df_Swap")
+df_Mod_Dur = _try_get("df_Mod_Dur")
+df_ESTR    = _try_get("df_ESTR")
+df_Repo    = _try_get("df_Repo")
+
+# =========================
+# Config
+# =========================
+AVAILABLE_COUNTRIES = ["Germany", "Italy", "France", "Spain"]
+AVAILABLE_MATURITIES = ["1Y","2Y","3Y","4Y","5Y","7Y","10Y","15Y","20Y","25Y","30Y"]
+
+MAX_SERIES = 10
+DEFAULT_NUM_SERIES = 1
+BENCHMARK_MATURITY = "10Y"
+
+# Vol logic = 63d (~3M); for "6 months" we use 126 trading days
+WINDOW_3M = 63
+LOOKBACK_DAYS = 126  # fixed 126d window for candlestick-like plots
+
+# =========================
+# Helpers
+# =========================
+def ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+def slice_last_days(s: pd.Series, days: int) -> pd.Series:
+    """
+    Return the last `days` observations. Using count-based slicing aligns with trading days logic
+    and is robust to holidays/missing calendar dates.
+    """
+    s = s.dropna()
+    if s.empty:
+        return s
+    return s.iloc[-int(days):].copy()
+
+def _series_yield(country: str, maturity: str) -> pd.Series:
+    col = f"{country} {maturity}"
+    if (data is None) or (col not in data.columns):
+        raise KeyError(f"Yield column '{col}' not found in `data`.")
+    return ensure_dt_index(data)[col].astype(float)
+
+def _swap_estr(maturity: str) -> pd.Series:
+    if (df_Swap is None) or (maturity not in df_Swap.columns):
+        raise KeyError(f"Swap column '{maturity}' not found in `df_Swap`.")
+    return ensure_dt_index(df_Swap)[maturity].astype(float)
+
+def _mod_dur(maturity: str) -> pd.Series:
+    if (df_Mod_Dur is None) or (maturity not in df_Mod_Dur.columns):
+        raise KeyError(f"Modified duration '{maturity}' not found in `df_Mod_Dur`.")
+    return ensure_dt_index(df_Mod_Dur)[maturity].astype(float)
+
+def _repo(country: str) -> pd.Series:
+    if (df_Repo is None) or (country not in df_Repo.columns):
+        raise KeyError(f"Repo column '{country}' not found in `df_Repo`.")
+    return ensure_dt_index(df_Repo)[country].astype(float)
+
+def _estr3m_series() -> pd.Series:
+    if (df_ESTR is None) or (df_ESTR.shape[1] < 1):
+        raise KeyError("`df_ESTR` must have a single column with the 3M ESTR series.")
+    return ensure_dt_index(df_ESTR).iloc[:, 0].astype(float)
+
+# =========================
+# Core carry/vol computations
+# =========================
+def compute_carry_3m(country: str, maturity: str) -> pd.Series:
+    """
+    Carry 3M daily time series:
+      (Yield - Swap(maturity) - (Repo(country) - ESTR_3M)) / (4 * ModifiedDuration(maturity))
+    """
+    y    = _series_yield(country, maturity)
+    s    = _swap_estr(maturity)
+    md   = _mod_dur(maturity).replace(0, np.nan)
+    repo = _repo(country)
+    estr3 = _estr3m_series()
+    df = pd.concat({"yield": y, "swap": s, "mod_dur": md, "repo": repo, "estr3m": estr3}, axis=1).dropna()
+    carry = (df["yield"] - df["swap"] - (df["repo"] - df["estr3m"])) / (4.0 * df["mod_dur"])
+    carry.name = f"{country} {maturity} Carry 3M"
+    return carry
+
+def compute_vol_3m(country: str, maturity: str) -> pd.Series:
+    """
+    Rolling 3M volatility of yield daily changes (in bps):
+      vol = std( Δ(yield% * 100) ) over 63 obs
+    """
+    y = _series_yield(country, maturity).dropna()
+    dy = (y * 100.0).diff()
+    vol = dy.rolling(WINDOW_3M, min_periods=WINDOW_3M//2).std()
+    vol.name = f"{country} {maturity} Vol 3M (bps/day)"
+    return vol
+
+def compute_carry_over_vol(country: str, maturity: str) -> pd.Series:
+    carry = compute_carry_3m(country, maturity)
+    vol   = compute_vol_3m(country, maturity)
+    df    = pd.concat([carry, vol], axis=1).dropna()
+    cov   = df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)
+    cov.name = f"{country} {maturity} Carry/Vol"
+    return cov
+
+# =========================
+# Matplotlib candlestick-like (YOUR format)
+# =========================
+def _to_png(fig) -> str:
+    """Render Matplotlib figure to base64 PNG for embedding in Dash."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
+    plt.close(fig)
+    buf.seek(0)
+    return "data:image/png;base64," + base64.b64encode(buf.read()).decode("ascii")
+
+# ---------- nucleus: draw a "candlestick" for a sub-table ----------
+def _draw_candles(ax, rows, x_key, x_is_bucket=True, title="Candlestick", xlabel="Maturity Buckets"):
+    """
+    rows: DataFrame filtered for a country (or pair) with columns:
+          Min, Max, Q25, Q50, Q75, Vol, CarryOverVol, CarryOneWeekAgo, and x_key (Bucket or Box/Fly).
+    x_key: 'Bucket' or 'Box'/'Fly'
+    x_is_bucket: True if x is numeric (buckets); False if categorical (Box/Fly)
+    """
+    import pandas as pd  # local import to mirror your snippet
+    import numpy as np
+
+    # -- Properly coerce numeric columns (avoid str/float errors)
+    cols_num = ["Min","Max","Q25","Q50","Q75","Vol","CarryOverVol","CarryOneWeekAgo"]
+    for c in cols_num:
+        if c in rows.columns:
+            rows[c] = pd.to_numeric(rows[c], errors="coerce")
+
+    label_added = False
+
+    # If x is categorical -> map to positions 1..N preserving order
+    if not x_is_bucket:
+        cats = rows[x_key].astype(str).tolist()
+        order = list(dict.fromkeys(cats))
+        xpos = {lab: i+1 for i, lab in enumerate(order)}
+        ax.set_xticks(list(xpos.values()))
+        ax.set_xticklabels(order, rotation=0)
+    else:
+        xpos = None
+
+    for _, row in rows.iterrows():
+        vol = row.get('Vol', np.nan)
+        if pd.isna(vol) or vol <= 0:
+            continue
+
+        # X
+        x = row[x_key] if x_is_bucket else xpos[str(row[x_key])]
+
+        # Y (ratios)
+        min_val      = row['Min']  / vol if pd.notna(row['Min'])  else np.nan
+        max_val      = row['Max']  / vol if pd.notna(row['Max'])  else np.nan
+        q1_val       = row['Q25']  / vol if pd.notna(row['Q25'])  else np.nan
+        q3_val       = row['Q75']  / vol if pd.notna(row['Q75'])  else np.nan
+        median_val   = row['Q50']  / vol if pd.notna(row['Q50'])  else np.nan
+        current_val  = row['CarryOverVol']                     # already (carry/vol)
+        one_week_val = row['CarryOneWeekAgo'] / vol if pd.notna(row['CarryOneWeekAgo']) else np.nan
+
+        # Skip if key values missing
+        if any(pd.isna(v) for v in [min_val, max_val, q1_val, q3_val, median_val, current_val]):
+            continue
+
+        # Min–Max whiskers
+        ax.plot([x, x], [min_val, max_val], color='black', marker='_', linewidth=2)
+        # Thick Q25–Q75 block
+        ax.plot([x, x], [q1_val, q3_val], color='black', linewidth=8, alpha=0.5)
+        ax.plot([x, x], [q1_val, q3_val], color='white', linewidth=6, alpha=1.0)
+        # Median
+        ax.plot([x, x], [median_val, median_val], color='black', marker='_', markersize=6)
+        # Current (red)
+        ax.plot(x, current_val, color='red', marker='_', markersize=10,
+                label='Current Value' if not label_added else "")
+        # One week ago (blue)
+        if pd.notna(one_week_val):
+            ax.plot(x, one_week_val, color='steelblue', marker='_', markersize=8,
+                    label='1 Week ago' if not label_added else "")
+
+        label_added = True
+
+    ax.set_title(title)
+    ax.set_ylabel("CarryOverVol")
+    ax.set_xlabel(xlabel)
+    ax.legend(loc='upper right')
+    ax.grid(True)
+    plt.tight_layout()
+
+def _rows_from_series_for_draw(series: pd.Series, vol_for_div: float, current_ratio: float,
+                               one_week_ago_raw: float, x_value, x_is_bucket=True) -> pd.DataFrame:
+    """
+    Build the single-row DataFrame expected by _draw_candles.
+    - series: history (window) of the quantity BEFORE division by 'vol_for_div'.
+    - vol_for_div: denominator "Vol" column used by _draw_candles.
+    - current_ratio: already Carry/Vol (red marker).
+    - one_week_ago_raw: raw Carry value 5 business days ago; _draw_candles will divide it by vol_for_div.
+    - x_value: bucket position or category label.
+    """
+    s = series.dropna()
+    if s.empty or not np.isfinite(vol_for_div) or vol_for_div <= 0:
+        return pd.DataFrame(columns=["Bucket","Min","Max","Q25","Q50","Q75","Vol","CarryOverVol","CarryOneWeekAgo"])
+    q = s.quantile([0.25, 0.5, 0.75])
+    return pd.DataFrame([{
+        "Bucket": x_value if x_is_bucket else 1,
+        "Min": float(s.min()),
+        "Max": float(s.max()),
+        "Q25": float(q.loc[0.25]),
+        "Q50": float(q.loc[0.5]),
+        "Q75": float(q.loc[0.75]),
+        "Vol": float(vol_for_div),
+        "CarryOverVol": float(current_ratio),
+        "CarryOneWeekAgo": float(one_week_ago_raw) if np.isfinite(one_week_ago_raw) else np.nan
+    }])
+
+# =========================
+# Plotly helpers
+# =========================
+def fig_lines(series_dict: Dict[str, pd.Series], title: str, ylab: str) -> go.Figure:
+    fig = go.Figure()
+    for label, s in series_dict.items():
+        s = s.dropna() if s is not None else pd.Series(dtype=float)
+        if s.empty: continue
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=label))
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis=dict(tickformat="%Y"),
+        yaxis=dict(title=ylab),
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+        margin=dict(l=50, r=20, t=40, b=40)
+    )
+    return fig
+
+# =========================
+# App
+# =========================
+app: Dash = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "Carry — Dash"
+
+def _country_options():  return [{"label": c, "value": c} for c in AVAILABLE_COUNTRIES]
+def _maturity_options(): return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
+
+app.layout = html.Div([
+    html.H2("📈 Carry & Carry/Vol — Dashboard"),
+    html.Div(id="warn-data", style={"color":"crimson", "marginBottom":"8px"}),
+
+    # Top controls
+    html.Div([
+        html.Div([
+            html.Label("How many series on the same chart?"),
+            dcc.Dropdown(
+                id="num-series",
+                options=[{"label": str(i), "value": i} for i in range(1, MAX_SERIES+1)],
+                value=DEFAULT_NUM_SERIES, clearable=False, style={"width":"220px"}
+            ),
+        ], style={"display":"inline-block","marginRight":"24px","verticalAlign":"top"}),
+
+        html.Div(id="dynamic-pickers", style={"display":"inline-block","verticalAlign":"top"}),
+    ], style={"marginBottom":"6px"}),
+
+    # --- NEW: show the carry formula right under the selectors ---
+    html.Div([
+        html.Span("Carry 3M formula: "),
+        html.Code("(Yield − matched maturity ESTR swap − (Repo − ESTR 3M)) / (4 × Modified Duration)")
+    ], style={"marginBottom":"10px","color":"#444"}),
+
+    # Time series
+    html.Div([
+        html.Div([dcc.Graph(id="fig_carry",    config={"displaylogo": False})],
+                 style={"width":"100%","display":"inline-block","marginBottom":"8px"}),
+        html.Div([dcc.Graph(id="fig_carryvol", config={"displaylogo": False})],
+                 style={"width":"100%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+
+    # Candlestick-like section (fixed countries, benchmark maturity)
+    html.H3(f"Candlestick-like (126d lookback, {BENCHMARK_MATURITY})"),
+    html.Div("Left = Carry 3M   |   Right = Carry/Vol 3M"),
+    html.Div(id="candles-grid", children=[
+        # 4 rows, 2 images each
+        html.Div([
+            html.Div([html.Img(id={"type":"mpl-carry", "country":"Germany"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+            html.Div([html.Img(id={"type":"mpl-cov",   "country":"Germany"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+        ], style={"marginBottom":"10px"}),
+        html.Div([
+            html.Div([html.Img(id={"type":"mpl-carry", "country":"Italy"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+            html.Div([html.Img(id={"type":"mpl-cov",   "country":"Italy"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+        ], style={"marginBottom":"10px"}),
+        html.Div([
+            html.Div([html.Img(id={"type":"mpl-carry", "country":"France"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+            html.Div([html.Img(id={"type":"mpl-cov",   "country":"France"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+        ], style={"marginBottom":"10px"}),
+        html.Div([
+            html.Div([html.Img(id={"type":"mpl-carry", "country":"Spain"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+            html.Div([html.Img(id={"type":"mpl-cov",   "country":"Spain"}, style={"width":"100%","border":"1px solid #eee"})],
+                     style={"width":"49%","display":"inline-block"}),
+        ], style={"marginBottom":"10px"}),
+    ]),
+
+    # hidden to trigger initial render of static candles
+    html.Div(id="init-trigger", style={"display":"none"}),
+])
+
+# =========================
+# Dynamic pickers
+# =========================
+@app.callback(
+    Output("dynamic-pickers", "children"),
+    Input("num-series", "value"),
+)
+def render_dynamic_pickers(n):
+    n = int(n or 1)
+    rows = []
+    for i in range(1, n+1):
+        rows.append(html.Div([
+            html.Label(f"Series {i} — Country & Maturity"),
+            dcc.Dropdown(id={"type":"country-dd", "index":i}, options=_country_options(),
+                         placeholder=f"Country {i}", clearable=True, style={"width":"240px","display":"inline-block","marginRight":"8px"}),
+            dcc.Dropdown(id={"type":"maturity-dd","index":i}, options=_maturity_options(),
+                         placeholder=f"Maturity {i}", clearable=True, style={"width":"160px","display":"inline-block"}),
+        ], style={"marginBottom":"6px"}))
+    return rows
+
+# =========================
+# Time-series figures
+# =========================
+@app.callback(
+    Output("fig_carry", "figure"),
+    Output("fig_carryvol", "figure"),
+    Output("warn-data", "children"),
+
+    Input("num-series", "value"),
+    Input({"type":"country-dd","index":ALL}, "value"),
+    Input({"type":"maturity-dd","index":ALL}, "value"),
+)
+def update_timeseries(n, countries, maturities):
+    empty = go.Figure(); empty.update_layout(template="plotly_white")
+    if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]):
+        return empty, empty, "Missing DataFrames. Provide `data`, `df_Swap`, `df_Mod_Dur`, `df_ESTR`, `df_Repo`."
+
+    countries = countries or []
+    maturities = maturities or []
+    series_carry: Dict[str, pd.Series] = {}
+    series_cov:   Dict[str, pd.Series] = {}
+
+    for c, m in zip(countries, maturities):
+        if not c or not m: continue
+        label = f"{c} {m}"
+        try:
+            series_carry[label] = compute_carry_3m(c, m)
+            series_cov[label]   = compute_carry_over_vol(c, m)
+        except Exception:
+            # skip broken pairs silently
+            continue
+
+    fig1 = fig_lines(series_carry, "Carry 3M over time", "Carry 3M")
+    fig2 = fig_lines(series_cov,   "Carry/Vol 3M over time", "Carry/Vol 3M")
+    return fig1, fig2, ""
+
+# =========================
+# Candlestick-like (per country) images
+# =========================
+def _shift_business_days_to_past(s: pd.Series, n: int = 5) -> float:
+    """Return the value n business days ago aligned on last index."""
+    s = s.dropna()
+    if s.empty: return np.nan
+    s_b = s.asfreq("B").ffill()
+    val = s_b.shift(n).reindex([s_b.index.max()]).iloc[0]
+    return float(val) if np.isfinite(val) else np.nan
+
+@app.callback(
+    Output({"type":"mpl-carry","country":MATCH}, "src"),
+    Output({"type":"mpl-cov",  "country":MATCH}, "src"),
+    Input("init-trigger", "children"),
+    State({"type":"mpl-carry","country":MATCH}, "id"),
+)
+def render_candles(_, id_state):
+    # If data missing, return blank
+    if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]):
+        blank = "data:image/png;base64,"
+        return blank, blank
+
+    ctry = id_state["country"]
+    matu = BENCHMARK_MATURITY
+
+    try:
+        carry = compute_carry_3m(ctry, matu)
+        vol3m = compute_vol_3m(ctry, matu)
+        cov   = compute_carry_over_vol(ctry, matu)
+    except Exception:
+        blank = "data:image/png;base64,"
+        return blank, blank
+
+    # 126d slices (fixed)
+    carry126 = slice_last_days(carry, LOOKBACK_DAYS)
+    cov126   = slice_last_days(cov,   LOOKBACK_DAYS)
+
+    latest_carry = float(carry.dropna().iloc[-1]) if not carry.dropna().empty else np.nan
+    latest_cov   = float(cov.dropna().iloc[-1])   if not cov.dropna().empty   else np.nan
+
+    # One week ago (business days)
+    carry_1w_raw = _shift_business_days_to_past(carry, n=5)
+
+    # ---------- Figure 1: Carry (Vol=1 so draw shows pure carry) ----------
+    rows_carry = _rows_from_series_for_draw(
+        series=carry126,
+        vol_for_div=1.0,
+        current_ratio=latest_carry,        # carry / 1
+        one_week_ago_raw=carry_1w_raw,     # will be /1 inside draw()
+        x_value=1, x_is_bucket=True
+    )
+    fig1, ax1 = plt.subplots(figsize=(9, 5))
+    _draw_candles(ax1, rows_carry, x_key="Bucket", x_is_bucket=True,
+                  title=f"{ctry} {matu} — Carry 3M (126d window)",
+                  xlabel="(Single bucket)")
+    ax1.set_ylabel("Carry 3M")
+    img1 = _to_png(fig1)
+
+    # ---------- Figure 2: Carry/Vol — strict quantiles on the ratio ----------
+    # To match the ratio distribution exactly, compute quartiles of cov (ratio) and set Vol=1
+    if not vol3m.dropna().empty:
+        vol_1w = _shift_business_days_to_past(vol3m, n=5)
+    else:
+        vol_1w = np.nan
+    one_week_ratio = (carry_1w_raw / vol_1w) if (np.isfinite(carry_1w_raw) and np.isfinite(vol_1w) and vol_1w != 0) else np.nan
+
+    rows_cov = _rows_from_series_for_draw(
+        series=cov126,            # already ratio
+        vol_for_div=1.0,          # division by 1 inside draw()
+        current_ratio=latest_cov, # red marker = ratio today
+        one_week_ago_raw=one_week_ratio,  # already ratio
+        x_value=1, x_is_bucket=True
+    )
+    fig2, ax2 = plt.subplots(figsize=(9, 5))
+    _draw_candles(ax2, rows_cov, x_key="Bucket", x_is_bucket=True,
+                  title=f"{ctry} {matu} — Carry/Vol 3M (126d window)",
+                  xlabel="(Single bucket)")
+    img2 = _to_png(fig2)
+
+    return img1, img2
+
+# Trigger the static images once (and on TS refresh if you want)
+@app.callback(Output("init-trigger", "children"), Input("num-series", "value"))
+def trigger_init(_):
+    return "ready"
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
+        return ip
+
+    host, port = "0.0.0.0", 8057
+    local_ip = get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (you) : http://localhost:{port}")
+    print(f"LAN (team)  : http://{local_ip}:{port}")
+    print("==============================================\n")
+    try:
+        webbrowser.open(f"http://localhost:{port}")
+    except Exception:
+        pass
+    app.run_server(host=host, port=port, debug=False)
