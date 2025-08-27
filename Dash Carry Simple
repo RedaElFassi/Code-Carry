@@ -49,7 +49,7 @@ BUCKETS_NUM          = [1,2,3,4,5,7,10,15,20,25,30]
 MAX_SERIES = 10
 DEFAULT_NUM_SERIES = 1
 
-WINDOW_3M     = 63   # ~ 3 months
+WINDOW_3M     = 63   # ~ 3 months (vol)
 LOOKBACK_DAYS = 126  # ~ 6 months for candlesticks
 
 CANDLE_FIGSIZE: Tuple[float, float] = (12.0, 5.5)
@@ -71,9 +71,9 @@ def slice_last_days(s: pd.Series, days: int) -> pd.Series:
 
 def matu_to_bucket(m: str) -> int:
     try:
-        return int(str(m).upper().replace("Y","").strip())
+        return int(str(m).upper().replace("Y", "").strip())
     except Exception:
-        return np.nan
+        return np.nan  # type: ignore[return-value]
 
 def _col_yield(country: str, maturity: str) -> str:
     return f"{country} {maturity}"
@@ -114,17 +114,13 @@ def compute_carry_3m(country: str, maturity: str) -> pd.Series:
     """
     Carry 3M (bps) = ((Yield - ESTR Swap(maturity) - (Repo - ESTR 3M)) / (4 * ModifiedDuration)) * 100
     """
-    y     = _series_yield(country, maturity)     # %
-    s     = _swap_estr(maturity)                 # %
-    md    = _mod_dur(maturity).replace(0, np.nan)
-    repo  = _repo(country)                       # %
-    estr3 = _estr3m_series()                     # %
+    y     = _series_yield(country, maturity)         # %
+    s     = _swap_estr(maturity)                     # %
+    md    = _mod_dur(maturity).replace(0, np.nan)    # unitless
+    repo  = _repo(country)                           # %
+    estr3 = _estr3m_series()                         # %
 
-    df = pd.concat(
-        {"yield": y, "swap": s, "mod_dur": md, "repo": repo, "estr3m": estr3},
-        axis=1
-    ).dropna()
-
+    df = pd.concat({"yield": y, "swap": s, "mod_dur": md, "repo": repo, "estr3m": estr3}, axis=1).dropna()
     carry_bps = ((df["yield"] - df["swap"] - (df["repo"] - df["estr3m"])) / (4.0 * df["mod_dur"])) * 100.0
     carry_bps.name = f"{country} {maturity} Carry 3M (bps)"
     return carry_bps
@@ -135,7 +131,7 @@ def compute_vol_3m(country: str, maturity: str) -> pd.Series:
     """
     y = _series_yield(country, maturity).dropna()
     dy_bps = (y * 100.0).diff()
-    vol = dy_bps.rolling(WINDOW_3M, min_periods=WINDOW_3M//2).std()
+    vol = dy_bps.rolling(WINDOW_3M, min_periods=WINDOW_3M // 2).std()
     vol.name = f"{country} {maturity} Vol 3M (bps/day)"
     return vol
 
@@ -164,15 +160,15 @@ def _draw_candles(ax: plt.Axes, rows: pd.DataFrame, title: str, xlabel: str, yla
     """
     rows columns: ["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"]
     """
-    # Align x across all plots
     ax.set_xticks(BUCKETS_NUM)
     ax.set_xticklabels([f"{b}Y" for b in BUCKETS_NUM], rotation=0)
 
     label_added = False
     for _, row in rows.iterrows():
-        if pd.isna(row.get("Bucket")):
+        b = row.get("Bucket", np.nan)
+        if not np.isfinite(b):
             continue
-        x     = int(row["Bucket"])
+        x     = int(b)
         min_v = float(row.get("Min", np.nan))
         max_v = float(row.get("Max", np.nan))
         q25   = float(row.get("Q25", np.nan))
@@ -184,21 +180,15 @@ def _draw_candles(ax: plt.Axes, rows: pd.DataFrame, title: str, xlabel: str, yla
         if any(np.isnan(v) for v in [min_v, max_v, q25, q50, q75, curr]):
             continue
 
-        # Whiskers
-        ax.plot([x, x], [min_v, max_v], color="black", linewidth=2)
-        # Thick block Q25–Q75
-        ax.plot([x, x], [q25, q75], color="black", linewidth=8, alpha=0.5)
-        ax.plot([x, x], [q25, q75], color="white", linewidth=6, alpha=1.0)
-        # Median
-        ax.plot(x, q50, color="black", marker="_", markersize=6)
-        # Current
-        ax.plot(x, curr, color="red", marker="_", markersize=10,
+        ax.plot([x, x], [min_v, max_v], color="black", linewidth=2)                 # whiskers
+        ax.plot([x, x], [q25, q75], color="black", linewidth=8, alpha=0.5)          # block outline
+        ax.plot([x, x], [q25, q75], color="white", linewidth=6, alpha=1.0)          # block fill
+        ax.plot(x, q50, color="black", marker="_", markersize=6)                    # median
+        ax.plot(x, curr, color="red", marker="_", markersize=10,                    # current
                 label="Current" if not label_added else "")
-        # One week ago
         if pd.notna(prev):
-            ax.plot(x, float(prev), color="steelblue", marker="_", markersize=8,
+            ax.plot(x, float(prev), color="steelblue", marker="_", markersize=8,    # 1W ago
                     label="1W ago" if not label_added else "")
-
         label_added = True
 
     ax.set_title(title)
@@ -251,31 +241,34 @@ def _build_candlestick_tables_for_country(country: str) -> Tuple[pd.DataFrame, p
         except Exception:
             continue
 
-        # latest & 1w ago
         curr_carry = float(carry_bps.dropna().iloc[-1]) if not carry_bps.dropna().empty else np.nan
         curr_cov   = float(cov.dropna().iloc[-1])       if not cov.dropna().empty       else np.nan
         carry_1w   = _shift_business_days_to_past(carry_bps, n=5) if not carry_bps.dropna().empty else np.nan
-        cov_1w     = _shift_business_days_to_past(cov,       n=5) if not cov.dropna().empty       else np.nan
+        cov_1w     = _shift_business_days_to_past(cov, n=5)       if not cov.dropna().empty       else np.nan
 
         if not slice_last_days(carry_bps, LOOKBACK_DAYS).empty:
             rows_carry_list.append(
                 _rows_from_series_for_draw(
-                    series=carry_bps, x_bucket=int(bucket),
-                    current_value=curr_carry, one_week_ago_value=carry_1w
+                    series=carry_bps,
+                    x_bucket=int(bucket),
+                    current_value=curr_carry,
+                    one_week_ago_value=carry_1w
                 )
             )
         if not slice_last_days(cov, LOOKBACK_DAYS).empty:
             rows_cov_list.append(
                 _rows_from_series_for_draw(
-                    series=cov, x_bucket=int(bucket),
-                    current_value=curr_cov, one_week_ago_value=cov_1w
+                    series=cov,
+                    x_bucket=int(bucket),
+                    current_value=curr_cov,
+                    one_week_ago_value=cov_1w
                 )
             )
 
     rows_carry = pd.concat(rows_carry_list, ignore_index=True) if rows_carry_list else pd.DataFrame(
         columns=["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"]
     )
-    rows_cov   = pd.concat(rows_cov_list,   ignore_index=True) if rows_cov_list   else pd.DataFrame(
+    rows_cov = pd.concat(rows_cov_list, ignore_index=True) if rows_cov_list else pd.DataFrame(
         columns=["Bucket","Min","Max","Q25","Q50","Q75","CarryOverVol","CarryOneWeekAgo"]
     )
 
@@ -312,12 +305,15 @@ def fig_lines(series_dict: Dict[str, pd.Series], title: str, ylab: str) -> go.Fi
 app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Carry Dashboard"
 
-def _country_options():  return [{"label": c, "value": c} for c in AVAILABLE_COUNTRIES]
-def _maturity_options(): return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
+def _country_options():
+    return [{"label": c, "value": c} for c in AVAILABLE_COUNTRIES]
+
+def _maturity_options():
+    return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
 
 app.layout = html.Div([
     html.H2("📈 Carry & Carry/Vol — Dashboard"),
-    html.Div(id="warn-data", style={"color":"crimson","marginBottom":"8px"}),
+    html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
 
     # Controls
     html.Div([
@@ -325,74 +321,69 @@ app.layout = html.Div([
             html.Label("How many series on the same chart?"),
             dcc.Dropdown(
                 id="num-series",
-                options=[{"label": str(i), "value": i} for i in range(1, MAX_SERIES+1)],
+                options=[{"label": str(i), "value": i} for i in range(1, MAX_SERIES + 1)],
                 value=DEFAULT_NUM_SERIES,
                 clearable=False,
-                style={"width":"220px"}
+                style={"width": "220px"}
             )
-        ], style={"display":"inline-block","verticalAlign":"top","marginRight":"24px"}),
+        ], style={"display": "inline-block", "verticalAlign": "top", "marginRight": "24px"}),
 
-        html.Div(id="dynamic-pickers", style={"display":"inline-block","verticalAlign":"top"})
-    ], style={"marginBottom":"6px"}),
+        html.Div(id="dynamic-pickers", style={"display": "inline-block", "verticalAlign": "top"})
+    ], style={"marginBottom": "6px"}),
 
     # Formula
     html.Div([
         html.Span("Carry 3M formula (in bps): "),
         html.Code("((Yield − matched maturity ESTR swap − (Repo − ESTR 3M)) / (4 × Modified Duration)) × 100")
-    ], style={"marginBottom":"10px","color":"#444"}),
+    ], style={"marginBottom": "10px", "color": "#444"}),
 
     # Time-series
     html.Div([
-        html.Div([dcc.Graph(id="fig_carry",    config={"displaylogo": False})],
-                 style={"width":"100%","display":"inline-block","marginBottom":"8px"}),
+        html.Div([dcc.Graph(id="fig_carry", config={"displaylogo": False})],
+                 style={"width": "100%", "display": "inline-block", "marginBottom": "8px"}),
         html.Div([dcc.Graph(id="fig_carryvol", config={"displaylogo": False})],
-                 style={"width":"100%","display":"inline-block"})
+                 style={"width": "100%", "display": "inline-block"})
     ]),
 
     html.Hr(),
 
     # Candlestick section
-    html.H3("CandleStick Plots — 6M History (126d) or Max Available",
-            style={"marginBottom":"6px"}),
-
+    html.H3("CandleStick Plots — 6M History (126d) or Max Available", style={"marginBottom": "6px"}),
     html.Div("Each chart shows 11 maturities on X: 1Y,2Y,3Y,4Y,5Y,7Y,10Y,15Y,20Y,25Y,30Y.",
-             style={"marginBottom":"8px","color":"#555"}),
+             style={"marginBottom": "8px", "color": "#555"}),
 
     html.Div(id="candles-grid", children=[
         *[
             html.Div([
                 html.Div([
-                    html.H4(f"CandleStick Carry vs Maturity — {ctry}",
-                            style={"margin":"4px 0 8px 0"}),
+                    html.H4(f"CandleStick Carry vs Maturity — {ctry}", style={"margin": "4px 0 8px 0"}),
                     html.Img(
-                        id={"type":"mpl-carry", "country": ctry},
+                        id={"type": "mpl-carry", "country": ctry},
                         style={
-                            "width":"100%","height":"420px","objectFit":"contain",
-                            "display":"block","border":"1px solid #eee","backgroundColor":"#fff"
+                            "width": "100%", "height": "420px", "objectFit": "contain",
+                            "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"
                         }
                     )
                 ]),
                 html.Div([
-                    html.H4(f"CandleStick Carry/Vol vs Maturity — {ctry}",
-                            style={"margin":"4px 0 8px 0"}),
+                    html.H4(f"CandleStick Carry/Vol vs Maturity — {ctry}", style={"margin": "4px 0 8px 0"}),
                     html.Img(
-                        id={"type":"mpl-cov", "country": ctry},
+                        id={"type": "mpl-cov", "country": ctry},
                         style={
-                            "width":"100%","height":"420px","objectFit":"contain",
-                            "display":"block","border":"1px solid #eee","backgroundColor":"#fff"
+                            "width": "100%", "height": "420px", "objectFit": "contain",
+                            "display": "block", "border": "1px solid #eee", "backgroundColor": "#fff"
                         }
                     )
                 ])
             ], style={
-                "display":"grid","gridTemplateColumns":"1fr 1fr","columnGap":"16px",
-                "alignItems":"stretch","marginBottom":"16px"
+                "display": "grid", "gridTemplateColumns": "1fr 1fr", "columnGap": "16px",
+                "alignItems": "stretch", "marginBottom": "16px"
             })
             for ctry in AVAILABLE_COUNTRIES
         ]
-    ], style={"display":"grid","rowGap":"6px"}),
+    ], style={"display": "grid", "rowGap": "6px"}),
 
-    # Hidden trigger to render candlesticks
-    html.Div(id="init-trigger", style={"display":"none"})
+    html.Div(id="init-trigger", style={"display": "none"})
 ])
 
 # =========================
@@ -408,18 +399,26 @@ def pickers(n):
     except Exception:
         n = 1
     rows = []
-    for i in range(1, n+1):
+    for i in range(1, n + 1):
         rows.append(
             html.Div([
                 html.Label(f"Series {i} — Country & Maturity",
-                           style={"display":"block","marginBottom":"2px"}),
-                dcc.Dropdown(id={"type":"country","i":i}, options=_country_options(),
-                             placeholder="Country", clearable=True,
-                             style={"width":"240px","display":"inline-block","marginRight":"8px"}),
-                dcc.Dropdown(id={"type":"maturity","i":i}, options=_maturity_options(),
-                             placeholder="Maturity", clearable=True,
-                             style={"width":"160px","display":"inline-block"})
-            ], style={"marginBottom":"6px"})
+                           style={"display": "block", "marginBottom": "2px"}),
+                dcc.Dropdown(
+                    id={"type": "country", "i": i},
+                    options=_country_options(),
+                    placeholder="Country",
+                    clearable=True,
+                    style={"width": "240px", "display": "inline-block", "marginRight": "8px"}
+                ),
+                dcc.Dropdown(
+                    id={"type": "maturity", "i": i},
+                    options=_maturity_options(),
+                    placeholder="Maturity",
+                    clearable=True,
+                    style={"width": "160px", "display": "inline-block"}
+                )
+            ], style={"marginBottom": "6px"})
         )
     return rows
 
@@ -428,10 +427,10 @@ def pickers(n):
     Output("fig_carryvol", "figure"),
     Output("warn-data", "children"),
     Input("num-series", "value"),
-    Input({"type":"country","i":ALL}, "value"),
-    Input({"type":"maturity","i":ALL}, "value")
+    Input({"type": "country", "i": ALL}, "value"),
+    Input({"type": "maturity", "i": ALL}, "value")
 )
-def update_ts(n, countries, mats):
+def update_ts(_n, countries, mats):
     empty = go.Figure()
     empty.update_layout(template="plotly_white")
 
@@ -451,7 +450,6 @@ def update_ts(n, countries, mats):
             series_carry[label] = compute_carry_3m(c, m)
             series_cov[label]   = compute_carry_over_vol(c, m)
         except Exception:
-            # skip silently if columns missing/misaligned
             continue
 
     fig1 = fig_lines(series_carry, "Carry 3M over time", "Carry 3M (bps)")
@@ -459,19 +457,17 @@ def update_ts(n, countries, mats):
     return fig1, fig2, ""
 
 @app.callback(
-    Output({"type":"mpl-carry","country":MATCH}, "src"),
-    Output({"type":"mpl-cov","country":MATCH}, "src"),
+    Output({"type": "mpl-carry", "country": MATCH}, "src"),
+    Output({"type": "mpl-cov",   "country": MATCH}, "src"),
     Input("init-trigger", "children"),
-    State({"type":"mpl-carry","country":MATCH}, "id")
+    State({"type": "mpl-carry", "country": MATCH}, "id")
 )
 def render_candles(_, idstate):
-    # If data missing, return transparent placeholder
     if any(df is None for df in [data, df_Swap, df_Mod_Dur, df_ESTR, df_Repo]):
         blank = "data:image/png;base64,"
         return blank, blank
 
     ctry = idstate["country"]
-
     try:
         rows_carry, rows_cov = _build_candlestick_tables_for_country(ctry)
     except Exception:
